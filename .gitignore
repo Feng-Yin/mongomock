@@ -1,6 +1,9 @@
 AUTHORS
 ChangeLog
 
+#### vscode
+.vscode
+
 #### Python
 *.py[co]
 
