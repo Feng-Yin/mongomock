@@ -1807,26 +1807,29 @@ class CollectionAPITest(TestCase):
 
     @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
     def test__find_and_modify_with_sort(self):
-        self.db.collection.insert({'time_check': float(time.time())})
-        self.db.collection.insert({'time_check': float(time.time())})
-        self.db.collection.insert({'time_check': float(time.time())})
+        clock_iter = iter(range(1, 10))
+        self.db.collection.insert_one({'time_check': float(time.time() + next(clock_iter))})
+        self.db.collection.insert_one({'time_check': float(time.time() + next(clock_iter))})
+        self.db.collection.insert_one({'time_check': float(time.time() + next(clock_iter))})
 
-        start_check_time = float(time.time())
+        start_check_time = float(time.time() + next(clock_iter))
+        a = self.db.collection.find(
+            {'time_check': {'$lt': start_check_time}})
         self.db.collection.find_and_modify(
             {'time_check': {'$lt': start_check_time}},
-            {'$set': {'time_check': float(time.time()), 'checked': True}},
+            {'$set': {'time_check': float(time.time() + next(clock_iter)), 'checked': True}},
             sort=[('time_check', pymongo.ASCENDING)])
         sorted_records = sorted(list(self.db.collection.find()), key=lambda x: x['time_check'])
         self.assertEqual(sorted_records[-1]['checked'], True)
 
         self.db.collection.find_and_modify(
             {'time_check': {'$lt': start_check_time}},
-            {'$set': {'time_check': float(time.time()), 'checked': True}},
+            {'$set': {'time_check': float(time.time() + next(clock_iter)), 'checked': True}},
             sort=[('time_check', pymongo.ASCENDING)])
 
         self.db.collection.find_and_modify(
             {'time_check': {'$lt': start_check_time}},
-            {'$set': {'time_check': float(time.time()), 'checked': True}},
+            {'$set': {'time_check': float(time.time() + next(clock_iter)), 'checked': True}},
             sort=[('time_check', pymongo.ASCENDING)])
 
         expected = list(filter(lambda x: 'checked' in x, list(self.db.collection.find())))

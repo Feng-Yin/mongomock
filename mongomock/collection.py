@@ -140,9 +140,9 @@ class BulkWriteOperation(object):
 
         def exec_remove():
             if multi:
-                op_result = collection.__delete_many(selector, hint=hint).raw_result
+                op_result = collection._delete_many(selector, hint=hint).raw_result
             else:
-                op_result = collection.__delete_one(selector, hint=hint).raw_result
+                op_result = collection._delete_one(selector, hint=hint).raw_result
             if op_result.get('ok'):
                 return {'nRemoved': op_result.get('n')}
             err = op_result.get('err')
@@ -279,7 +279,7 @@ class BulkOperationBuilder(object):
 
     def insert(self, doc):
         def exec_insert():
-            self.collection.__insert_one(
+            self.collection._insert_one(
                 doc, bypass_document_validation=self._bypass_document_validation)
             return {'nInserted': 1}
         self.executors.append(exec_insert)
@@ -453,9 +453,9 @@ class Collection(object):
         return self._insert(data)
 
     def insert_one(self, document, bypass_document_validation=False, session=None):
-        return self.__insert_one(document, bypass_document_validation, session)
+        return self._insert_one(document, bypass_document_validation, session)
 
-    def __insert_one(self, document, bypass_document_validation=False, session=None):
+    def _insert_one(self, document, bypass_document_validation=False, session=None):
         if not bypass_document_validation:
             validate_is_mutable_mapping('document', document)
         return InsertOneResult(self._insert(document, session), acknowledged=True)
@@ -1013,13 +1013,13 @@ class Collection(object):
              allow_partial_results=False, oplog_replay=False, modifiers=None,
              batch_size=0, manipulate=True, collation=None, session=None,
              max_time_ms=None, **kwargs):
-        return self.__find(filter, projection, skip, limit,
+        return self._find(filter, projection, skip, limit,
              no_cursor_timeout, cursor_type, sort,
              allow_partial_results, oplog_replay, modifiers,
              batch_size, manipulate, collation, session,
              max_time_ms, **kwargs)
 
-    def __find(self, filter=None, projection=None, skip=0, limit=0,
+    def _find(self, filter=None, projection=None, skip=0, limit=0,
              no_cursor_timeout=False, cursor_type=None, sort=None,
              allow_partial_results=False, oplog_replay=False, modifiers=None,
              batch_size=0, manipulate=True, collation=None, session=None,
@@ -1286,9 +1286,9 @@ class Collection(object):
                 if filter_applies(filter, document))
 
     def find_one(self, filter=None, *args, **kwargs):  # pylint: disable=keyword-arg-before-vararg
-        return self.__find_one(filter, *args, **kwargs)
+        return self._find_one(filter, *args, **kwargs)
 
-    def __find_one(self, filter=None, *args, **kwargs):  # pylint: disable=keyword-arg-before-vararg
+    def _find_one(self, filter=None, *args, **kwargs):  # pylint: disable=keyword-arg-before-vararg
         # Allow calling find_one with a non-dict argument that gets used as
         # the id for the query.
         if filter is None:
@@ -1297,7 +1297,7 @@ class Collection(object):
             filter = {'_id': filter}
 
         try:
-            return next(self.__find(filter, *args, **kwargs))
+            return next(self._find(filter, *args, **kwargs))
         except StopIteration:
             return None
 
@@ -1348,7 +1348,7 @@ class Collection(object):
         if remove and update:
             raise ValueError("Can't do both update and remove")
 
-        old = self.__find_one(query, projection=projection, sort=sort)
+        old = self._find_one(query, projection=projection, sort=sort)
         if not old and not upsert:
             return
 
@@ -1356,14 +1356,14 @@ class Collection(object):
             query = {'_id': old['_id']}
 
         if remove:
-            self.__delete_one(query)
+            self._delete_one(query)
         else:
             updated = self._update(query, update, upsert)
             if updated['upserted']:
                 query = {'_id': updated['upserted']}
 
         if return_document is ReturnDocument.AFTER or kwargs.get('new'):
-            return self.__find_one(query, projection)
+            return self._find_one(query, projection)
         return old
 
     def save(self, to_save, manipulate=True, check_keys=True, **kwargs):
@@ -1378,17 +1378,17 @@ class Collection(object):
         return to_save.get('_id', None)
 
     def delete_one(self, filter, collation=None, hint=None, session=None):
-        return self.__delete_one(filter, collation, hint, session)
+        return self._delete_one(filter, collation, hint, session)
 
-    def __delete_one(self, filter, collation=None, hint=None, session=None):
+    def _delete_one(self, filter, collation=None, hint=None, session=None):
         validate_is_mapping('filter', filter)
         return DeleteResult(
             self._delete(filter, collation=collation, hint=hint, session=session), True)
 
     def delete_many(self, filter, collation=None, hint=None, session=None):
-        return self.__delete_many(filter, collation, hint, session)
+        return self._delete_many(filter, collation, hint, session)
 
-    def __delete_many(self, filter, collation=None, hint=None, session=None):
+    def _delete_many(self, filter, collation=None, hint=None, session=None):
         validate_is_mapping('filter', filter)
         return DeleteResult(
             self._delete(filter, collation=collation, hint=hint, multi=True, session=session), True)
@@ -1410,7 +1410,7 @@ class Collection(object):
             filter = {}
         if not isinstance(filter, Mapping):
             filter = {'_id': filter}
-        to_delete = list(self.__find(filter))
+        to_delete = list(self._find(filter))
         deleted_count = 0
         for doc in to_delete:
             doc_id = doc['_id']
@@ -1449,9 +1449,9 @@ class Collection(object):
         return len(list(self._iter_documents(spec)))
 
     def count_documents(self, filter, **kwargs):
-        return self.__count_documents(filter, **kwargs)
+        return self._count_documents(filter, **kwargs)
 
-    def __count_documents(self, filter, **kwargs):
+    def _count_documents(self, filter, **kwargs):
         if kwargs.pop('collation', None):
             raise_not_implemented(
                 'collation',
@@ -1479,13 +1479,16 @@ class Collection(object):
         return count if limit is None else min(count, limit)
 
     def estimated_document_count(self, **kwargs):
+        return self._estimated_document_count(**kwargs)
+
+    def _estimated_document_count(self, **kwargs):
         if kwargs.pop('session', None):
             raise ConfigurationError('estimated_document_count does not support sessions')
         unknown_kwargs = set(kwargs) - {'skip', 'limit', 'maxTimeMS', 'hint'}
         if unknown_kwargs:
             raise OperationFailure(
                 "BSON field 'count.%s' is an unknown field." % list(unknown_kwargs)[0])
-        return self.__count_documents({}, **kwargs)
+        return self._count_documents({}, **kwargs)
 
     def drop(self, session=None):
         if session:
@@ -1493,12 +1496,12 @@ class Collection(object):
         self.database.drop_collection(self.name)
 
     def ensure_index(self, key_or_list, cache_for=300, **kwargs):
-        return self.__create_index(key_or_list, cache_for, **kwargs)
+        return self._create_index(key_or_list, cache_for, **kwargs)
 
     def create_index(self, key_or_list, cache_for=300, session=None, **kwargs):
-        return self.__create_index(key_or_list, cache_for, session, **kwargs)
+        return self._create_index(key_or_list, cache_for, session, **kwargs)
 
-    def __create_index(self, key_or_list, cache_for=300, session=None, **kwargs):
+    def _create_index(self, key_or_list, cache_for=300, session=None, **kwargs):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
         index_list = helpers.create_index_list(key_or_list)
@@ -1614,9 +1617,9 @@ class Collection(object):
 
     def map_reduce(self, map_func, reduce_func, out, full_response=False,
                    query=None, limit=0, session=None):
-        return self.__map_reduce(map_func, reduce_func, out, full_response, query, limit, session)
+        return self._map_reduce(map_func, reduce_func, out, full_response, query, limit, session)
 
-    def __map_reduce(self, map_func, reduce_func, out, full_response=False,
+    def _map_reduce(self, map_func, reduce_func, out, full_response=False,
                    query=None, limit=0, session=None):
         if execjs is None:
             raise NotImplementedError(
@@ -1676,7 +1679,7 @@ class Collection(object):
             }
         ''')
         doc_list = [json.dumps(doc, default=json_util.default)
-                    for doc in self.__find(query)]
+                    for doc in self._find(query)]
         mapped_rows = map_ctx.call('doMap', map_func, doc_list)
         reduced_rows = reduce_ctx.call('doReduce', reduce_func, mapped_rows)[:limit]
         for reduced_row in reduced_rows:
@@ -1717,13 +1720,13 @@ class Collection(object):
 
     def inline_map_reduce(self, map_func, reduce_func, full_response=False,
                           query=None, limit=0, session=None):
-        return self.__map_reduce(
+        return self._map_reduce(
             map_func, reduce_func, {'inline': 1}, full_response, query, limit, session=session)
 
     def distinct(self, key, filter=None, session=None):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
-        return self.__find(filter).distinct(key)
+        return self._find(filter).distinct(key)
 
     def group(self, key, condition, initial, reduce, finalize=None):
         if execjs is None:
@@ -1750,7 +1753,7 @@ class Collection(object):
         doc_list_copy = []
         ret_array_copy = []
         reduced_val = {}
-        doc_list = [doc for doc in self.__find(condition)]
+        doc_list = [doc for doc in self._find(condition)]
         for doc in doc_list:
             doc_copy = copy.deepcopy(doc)
             for doc_key in doc:
@@ -1786,7 +1789,7 @@ class Collection(object):
         return ret_array
 
     def aggregate(self, pipeline, session=None, **unused_kwargs):
-        in_collection = [doc for doc in self.__find()]
+        in_collection = [doc for doc in self._find()]
         return aggregate.process_pipeline(in_collection, self.database, pipeline, session)
 
     def with_options(
