@@ -5,16 +5,16 @@ import collections
 import copy
 import datetime
 import decimal
+import functools
 import itertools
 import math
 import numbers
 import random
 import re
+import sys
 import warnings
 
 from sentinels import NOTHING
-import six
-from six import moves, raise_from
 
 from mongomock import command_cursor
 from mongomock import filtering
@@ -47,23 +47,27 @@ group_operators = [
     '$stdDevSamp',
     '$sum',
 ]
-arithmetic_operators = [
+unary_arithmetic_operators = {
     '$abs',
-    '$add',
     '$ceil',
-    '$divide',
     '$exp',
     '$floor',
     '$ln',
-    '$log',
     '$log10',
-    '$mod',
-    '$multiply',
-    '$pow',
     '$sqrt',
-    '$subtract',
     '$trunc',
-]
+}
+binary_arithmetic_operators = {
+    '$divide',
+    '$log',
+    '$mod',
+    '$pow',
+    '$subtract',
+}
+arithmetic_operators = unary_arithmetic_operators | binary_arithmetic_operators | {
+    '$add',
+    '$multiply',
+}
 project_operators = [
     '$max',
     '$min',
@@ -72,11 +76,16 @@ project_operators = [
     '$stdDevPop',
     '$stdDevSamp',
     '$arrayElemAt',
+    '$first',
+    '$last',
 ]
 control_flow_operators = [
     '$switch',
 ]
-projection_operators = ['$map', '$let', '$literal']
+projection_operators = [
+    '$let',
+    '$literal',
+]
 date_operators = [
     '$dateFromString',
     '$dateToString',
@@ -100,6 +109,7 @@ array_operators = [
     '$filter',
     '$indexOfArray',
     '$isArray',
+    '$map',
     '$range',
     '$reduce',
     '$reverseArray',
@@ -150,7 +160,8 @@ type_convertion_operators = [
     '$toInt',
     '$toDecimal',
     '$toLong',
-    '$arrayToObject'
+    '$arrayToObject',
+    '$objectToArray',
 ]
 
 
@@ -196,6 +207,8 @@ _GROUPING_OPERATOR_MAP = {
     '$mergeObjects': _merge_objects_operation,
     '$min': lambda values: _group_operation(values, min),
     '$max': lambda values: _group_operation(values, max),
+    '$first': lambda values: values[0] if values else None,
+    '$last': lambda values: values[-1] if values else None,
 }
 
 
@@ -220,7 +233,7 @@ class _Parser(object):
                 % (len(expression), expression))
 
         value_dict = {}
-        for k, v in six.iteritems(expression):
+        for k, v in expression.items():
             if k in arithmetic_operators:
                 return self._handle_arithmetic_operator(k, v)
             if k in project_operators:
@@ -283,14 +296,44 @@ class _Parser(object):
             return self.parse(expression)
         except KeyError:
             return NOTHING
+    
+    def _parse_or_none(self, expression):
+        """Modified version of _parse_or_nothing that returns None instead of NOTHING."""
+        value = self._parse_or_nothing(expression)
+        if value is NOTHING:
+            return None
+        return value
+
+    # TODO(guludo): alter callers of _parse_array_or_* to take appropriate
+    # actions when the returned value is not a list. Some of them already do.
+    def _parse_array_or_nothing(self, expression):
+        """Parse expression expected to return an array (which is a list in Python).
+        This if the expression is an array literal (list or tuple in Python),
+        then a list with every element parsed is returned. Otherwise, the
+        expression is parsed with _parse_or_nothing().
+        Note that is is still possible that the returned value is not a list,
+        so callers must act appropriately for such scenario.
+        This is useful for parsing arguments of expressions that are expected
+        to resolve to an array.
+        """
+        if isinstance(expression, (list, tuple)):
+            return [self._parse_or_none(v) for v in expression]
+        return self._parse_or_nothing(expression)
+
+    def _parse_array_or_none(self, expression):
+        """Modified version of _parse_array_or_nothing that returns None instead of NOTHING"""
+        value = self._parse_array_or_nothing(expression)
+        if value is NOTHING:
+            return None
+        return value
 
     def _parse_basic_expression(self, expression):
-        if isinstance(expression, six.string_types) and expression.startswith('$'):
+        if isinstance(expression, str) and expression.startswith('$'):
             if expression.startswith('$$'):
                 return helpers.get_value_by_dot(dict({
                     'ROOT': self._doc_dict,
                     'CURRENT': self._doc_dict,
-                }, **self._user_vars), expression[2:])
+                }, **self._user_vars), expression[2:], can_generate_array=True)
             return helpers.get_value_by_dot(self._doc_dict, expression[1:], can_generate_array=True)
         return expression
 
@@ -309,51 +352,78 @@ class _Parser(object):
         )
 
     def _handle_arithmetic_operator(self, operator, values):
-        if operator == '$abs':
-            return abs(self.parse(values))
+        if operator in unary_arithmetic_operators:
+            try:
+                number = self.parse(values)
+            except KeyError:
+                return None
+            if number is None:
+                return None
+            if not isinstance(number, numbers.Number):
+                raise OperationFailure(
+                    "Parameter to %s must evaluate to a number, got '%s'" %
+                    (operator, type(number)))
+
+            if operator == '$abs':
+                return abs(number)
+            if operator == '$ceil':
+                return math.ceil(number)
+            if operator == '$exp':
+                return math.exp(number)
+            if operator == '$floor':
+                return math.floor(number)
+            if operator == '$ln':
+                return math.log(number)
+            if operator == '$log10':
+                return math.log10(number)
+            if operator == '$sqrt':
+                return math.sqrt(number)
+            if operator == '$trunc':
+                return math.trunc(number)
+
+        if operator in binary_arithmetic_operators:
+            if not isinstance(values, (tuple, list)):
+                raise OperationFailure(
+                    "Parameter to %s must evaluate to a list, got '%s'" %
+                    (operator, type(values)))
+
+            if len(values) != 2:
+                raise OperationFailure('%s must have only 2 parameters' % operator)
+            number_0, number_1 = self.parse_many(values)
+            if number_0 is None or number_1 is None:
+                return None
+
+            if operator == '$divide':
+                return number_0 / number_1
+            if operator == '$log':
+                return math.log(number_0, number_1)
+            if operator == '$mod':
+                return math.fmod(number_0, number_1)
+            if operator == '$pow':
+                return math.pow(number_0, number_1)
+            if operator == '$subtract':
+                if isinstance(number_0, datetime.datetime) and \
+                        isinstance(number_1, (int, float)):
+                    number_1 = datetime.timedelta(milliseconds=number_1)
+                res = number_0 - number_1
+                if isinstance(res, datetime.timedelta):
+                    return round(res.total_seconds() * 1000)
+                return res
+
+        assert isinstance(values, (tuple, list)), \
+            "Parameter to %s must evaluate to a list, got '%s'" % (operator, type(values))
+
+        parsed_values = list(self.parse_many(values))
+        assert parsed_values, '%s must have at least one parameter' % operator
+        for value in parsed_values:
+            if value is None:
+                return None
+            assert isinstance(value, numbers.Number), '%s only uses numbers' % operator
         if operator == '$add':
-            return sum(self.parse(value) for value in values)
-        if operator == '$ceil':
-            return math.ceil(self.parse(values))
-        if operator == '$divide':
-            assert len(values) == 2, 'divide must have only 2 items'
-            return self.parse(values[0]) / self.parse(values[1])
-        if operator == '$exp':
-            return math.exp(self.parse(values))
-        if operator == '$floor':
-            return math.floor(self.parse(values))
-        if operator == '$ln':
-            return math.log(self.parse(values))
-        if operator == '$log':
-            assert len(values) == 2, 'log must have only 2 items'
-            return math.log(self.parse(values[0]), self.parse(values[1]))
-        if operator == '$log10':
-            return math.log10(self.parse(values))
-        if operator == '$mod':
-            assert len(values) == 2, 'mod must have only 2 items'
-            return math.fmod(self.parse(values[0]), self.parse(values[1]))
+            return sum(parsed_values)
         if operator == '$multiply':
-            return moves.reduce(
-                lambda x, y: x * y,
-                (self.parse(value) for value in values))
-        if operator == '$pow':
-            assert len(values) == 2, 'pow must have only 2 items'
-            return math.pow(self.parse(values[0]), self.parse(values[1]))
-        if operator == '$sqrt':
-            return math.sqrt(self.parse(values))
-        if operator == '$subtract':
-            assert len(values) == 2, 'subtract must have only 2 items'
-            value_0 = self.parse(values[0])
-            value_1 = self.parse(values[1])
-            if isinstance(value_0, datetime.datetime) and \
-                    isinstance(value_1, (six.integer_types, float)):
-                value_1 = datetime.timedelta(milliseconds=value_1)
-            res = value_0 - value_1
-            if isinstance(res, datetime.timedelta):
-                return round(res.total_seconds() * 1000)
-            return res
-        if operator == '$trunc':
-            return math.trunc(self.parse(values))
+            return functools.reduce(lambda x, y: x * y, parsed_values)
+
         # This should never happen: it is only a safe fallback if something went wrong.
         raise NotImplementedError(  # pragma: no cover
             "Although '%s' is a valid aritmetic operator for the aggregation "
@@ -364,10 +434,14 @@ class _Parser(object):
             values = self.parse(values) if isinstance(values, str) else self.parse_many(values)
             return _GROUPING_OPERATOR_MAP[operator](values)
         if operator == '$arrayElemAt':
-            key, index = values
-            array = self._parse_basic_expression(key)
-            index = self.parse(index)
-            return array[index]
+            key, value = values
+            array = self.parse(key)
+            index = self.parse(value)
+            try:
+                return array[index]
+            except IndexError as error:
+                raise KeyError('Array have length less than index value') from error
+
         raise NotImplementedError("Although '%s' is a valid project operator for the "
                                   'aggregation pipeline, it is currently not implemented '
                                   'in Mongomock.' % operator)
@@ -385,7 +459,7 @@ class _Parser(object):
                 raise OperationFailure('invalid parameter: expected an object (vars)')
             user_vars = {
                 var_key: self.parse(var_value)
-                for var_key, var_value in six.iteritems(value['vars'])
+                for var_key, var_value in value['vars'].items()
             }
             return _Parser(
                 self._doc_dict,
@@ -432,9 +506,9 @@ class _Parser(object):
 
             if string is None or delimiter is None:
                 return None
-            if not isinstance(string, six.string_types):
+            if not isinstance(string, str):
                 raise TypeError('split first argument must evaluate to string')
-            if not isinstance(delimiter, six.string_types):
+            if not isinstance(delimiter, str):
                 raise TypeError('split second argument must evaluate to string')
             return string.split(delimiter)
         if operator == '$substr':
@@ -475,7 +549,7 @@ class _Parser(object):
                 input_value = self.parse(values['input'])
             except KeyError:
                 return False
-            if not isinstance(input_value, six.string_types):
+            if not isinstance(input_value, str):
                 raise OperationFailure("$regexMatch needs 'input' to be of type string")
 
             try:
@@ -596,6 +670,43 @@ class _Parser(object):
 
             return None if None in parsed_list else list(itertools.chain.from_iterable(parsed_list))
 
+        if operator == '$map':
+            if not isinstance(value, dict):
+                raise OperationFailure('$map only supports an object as its argument')
+
+            # NOTE: while the two validations below could be achieved with
+            # one-liner set operations (e.g. set(value) - {'input', 'as',
+            # 'in'}), we prefer the iteration-based approaches in order to
+            # mimic MongoDB's behavior regarding the order of evaluation. For
+            # example, MongoDB complains about 'input' parameter missing before
+            # 'in'.
+            for k in ('input', 'in'):
+                if k not in value:
+                    raise OperationFailure("Missing '%s' parameter to $map" % k)
+
+            for k in value:
+                if k not in {'input', 'as', 'in'}:
+                    raise OperationFailure('Unrecognized parameter to $map: %s' % k)
+
+            input_array = self._parse_or_nothing(value['input'])
+
+            if input_array is None or input_array is NOTHING:
+                return None
+
+            if not isinstance(input_array, (list, tuple)):
+                raise OperationFailure('input to $map must be an array not %s' % type(input_array))
+
+            fieldname = value.get('as', 'this')
+            in_expr = value['in']
+            return [
+                _Parser(
+                    self._doc_dict,
+                    dict(self._user_vars, **{fieldname: item}),
+                    ignore_missing_keys=self._ignore_missing_keys,
+                ).parse(in_expr)
+                for item in input_array
+            ]
+
         if operator == '$size':
             if isinstance(value, list):
                 if len(value) != 1:
@@ -642,7 +753,7 @@ class _Parser(object):
                     'First argument to $slice must be an array, but is of type: {}'
                     .format(type(array_value)))
             for num, v in zip(('Second', 'Third'), value[1:]):
-                if not isinstance(v, six.integer_types):
+                if not isinstance(v, int):
                     raise OperationFailure(
                         '{} argument to $slice must be numeric, but is of type: {}'
                         .format(num, type(v)))
@@ -662,6 +773,66 @@ class _Parser(object):
                 stop = start
                 start = 0
             return array_value[start:stop]
+        
+        if operator == '$indexOfArray':
+            if not isinstance(value, (list, tuple)):
+                value = [value]
+            if len(value) < 2 or len(value) > 4:
+                raise OperationFailure(
+                    'Expression $indexOfArray takes at least 2 arguments, and '
+                    'at most 4, but %i were passed in.' % len(value)
+                )
+            array_value = self._parse_array_or_nothing(value[0])
+            search_value = self.parse(value[1])
+            start, end = 0, None
+            if len(value) > 2:
+                start = self.parse(value[2])
+            if len(value) > 3:
+                end = self.parse(value[3])
+
+            # Validate arguments
+            if array_value is NOTHING or array_value is None:
+                return None
+            if not isinstance(array_value, list):
+                raise OperationFailure(
+                    '$indexOfArray requires an array as a first argument, '
+                    'found: %s' % type(type(array_value))
+                )
+            if len(value) > 2:
+                if isinstance(start, int):
+                    if start < 0:
+                        raise OperationFailure(
+                            '$indexOfArray requires a nonnegative starting '
+                            'index, found: %r' % start
+                        )
+                else:
+                    raise OperationFailure(
+                        '$indexOfArrayrequires an integral starting index, '
+                        'found a value of type: %s, with value: "%r"' % (
+                            type(start), start
+                        )
+                    )
+            if len(value) > 3:
+                if isinstance(end, int):
+                    if end < 0:
+                        raise OperationFailure(
+                            '$indexOfArray requires a nonnegative ending '
+                            'index, found: %r' % end
+                        )
+                else:
+                    raise OperationFailure(
+                        '$indexOfArrayrequires an integral ending index, '
+                        'found a value of type: %s, with value: "%r"' % (
+                            type(end), end
+                        )
+                    )
+            if end is None:
+                end = len(array_value)
+
+            try:
+                return array_value.index(search_value, start, end)
+            except ValueError:
+                return -1
 
         raise NotImplementedError(
             "Although '%s' is a valid array operator for the "
@@ -700,8 +871,8 @@ class _Parser(object):
                 return None
             if decimal_support:
                 if isinstance(parsed, decimal128.Decimal128):
-                    return helpers.to_long(parsed.to_decimal())
-                return helpers.to_long(parsed)
+                    return int(parsed.to_decimal())
+                return int(parsed)
             raise NotImplementedError(
                 'You need to import the pymongo library to support decimal128 type.'
             )
@@ -731,9 +902,9 @@ class _Parser(object):
                 try:
                     decimal_value = decimal128.Decimal128(parsed)
                 except decimal.InvalidOperation as err:
-                    raise_from(OperationFailure(
+                    raise OperationFailure(
                         "Failed to parse number '%s' in $convert with no onError value:"
-                        'Failed to parse string to decimal' % parsed), err)
+                        'Failed to parse string to decimal' % parsed) from err
             elif isinstance(parsed, datetime.datetime):
                 epoch = datetime.datetime.utcfromtimestamp(0)
                 string_micro_seconds = str((parsed - epoch).total_seconds() * 1000).split('.', 1)[0]
@@ -767,6 +938,28 @@ class _Parser(object):
                 'arrays used with $arrayToObject must contain documents '
                 'with k and v fields or two-element arrays'
             )
+
+        # Document: https://docs.mongodb.com/manual/reference/operator/aggregation/objectToArray/
+        if operator == '$objectToArray':
+            try:
+                parsed = self.parse(values)
+            except KeyError:
+                return None
+
+            if parsed is None:
+                return None
+
+            if not isinstance(parsed, (dict, collections.OrderedDict)):
+                raise OperationFailure(
+                    '$objectToArray requires an object input, found: {}'.format(type(parsed))
+                )
+
+            if len(parsed) > 1 and sys.version_info < (3, 6):
+                raise NotImplementedError(
+                    "Although '%s' is a valid type conversion, it is not implemented for Python 2 "
+                    'and Python 3.5 in Mongomock yet.' % operator)
+
+            return [{'k': k, 'v': v} for k, v in parsed.items()]
 
         raise NotImplementedError(
             "Although '%s' is a valid type conversion operator for the "
@@ -890,10 +1083,10 @@ filtering.register_parse_expression(_parse_expression)
 
 def _accumulate_group(output_fields, group_list):
     doc_dict = {}
-    for field, value in six.iteritems(output_fields):
+    for field, value in output_fields.items():
         if field == '_id':
             continue
-        for operator, key in six.iteritems(value):
+        for operator, key in value.items():
             values = []
             for doc in group_list:
                 try:
@@ -902,10 +1095,6 @@ def _accumulate_group(output_fields, group_list):
                     continue
             if operator in _GROUPING_OPERATOR_MAP:
                 doc_dict[field] = _GROUPING_OPERATOR_MAP[operator](values)
-            elif operator == '$first':
-                doc_dict[field] = values[0] if values else None
-            elif operator == '$last':
-                doc_dict[field] = values[-1] if values else None
             elif operator == '$addToSet':
                 value = []
                 val_it = (val or None for val in values)
@@ -954,7 +1143,7 @@ def _handle_lookup_stage(in_collection, database, options):
         if operator not in options:
             raise OperationFailure(
                 "Must specify '%s' field for a $lookup" % operator)
-        if not isinstance(options[operator], six.string_types):
+        if not isinstance(options[operator], str):
             raise OperationFailure(
                 'Arguments to $lookup must be strings')
         if operator in ('as', 'localField', 'foreignField') and \
@@ -1006,13 +1195,13 @@ def _recursive_get(match, nested_fields):
 
 
 def _handle_graph_lookup_stage(in_collection, database, options):
-    if not isinstance(options.get('maxDepth', 0), six.integer_types):
+    if not isinstance(options.get('maxDepth', 0), int):
         raise OperationFailure(
             "Argument 'maxDepth' to $graphLookup must be a number")
     if not isinstance(options.get('restrictSearchWithMatch', {}), dict):
         raise OperationFailure(
             "Argument 'restrictSearchWithMatch' to $graphLookup must be a Dictionary")
-    if not isinstance(options.get('depthField', ''), six.string_types):
+    if not isinstance(options.get('depthField', ''), str):
         raise OperationFailure(
             "Argument 'depthField' to $graphlookup must be a string")
     if 'startWith' not in options:
@@ -1022,7 +1211,7 @@ def _handle_graph_lookup_stage(in_collection, database, options):
         if operator not in options:
             raise OperationFailure(
                 "Must specify '%s' field for a $graphLookup" % operator)
-        if not isinstance(options[operator], six.string_types):
+        if not isinstance(options[operator], str):
             raise OperationFailure(
                 "Argument '%s' to $graphLookup must be string" % operator)
         if options[operator].startswith('$'):
@@ -1085,7 +1274,7 @@ def _handle_group_stage(in_collection, unused_database, options):
 
         def _key_getter(doc):
             try:
-                return _parse_expression(_id, doc)
+                return _parse_expression(_id, doc, ignore_missing_keys=True)
             except KeyError:
                 return None
 
@@ -1140,9 +1329,9 @@ def _handle_bucket_stage(in_collection, unused_database, options):
         try:
             return options['default']
         except KeyError as err:
-            raise_from(OperationFailure(
+            raise OperationFailure(
                 '$bucket could not find a matching branch for '
-                'an input, and no default was specified.'), err)
+                'an input, and no default was specified.') from err
 
     def _get_bucket_id(doc):
         """Get the bucket ID for a document.
@@ -1202,7 +1391,7 @@ def _handle_unwind_stage(in_collection, unused_database, options):
     if not isinstance(options, dict):
         options = {'path': options}
     path = options['path']
-    if not isinstance(path, six.string_types) or path[0] != '$':
+    if not isinstance(path, str) or path[0] != '$':
         raise ValueError(
             '$unwind failed: exception: field path references must be prefixed '
             "with a '$' '%s'" % path)
@@ -1274,13 +1463,13 @@ def _combine_projection_spec(filter_list, original_filter, prefix=''):
 
     return collections.OrderedDict(
         (k, _combine_projection_spec(v, original_filter, prefix='%s%s.' % (prefix, k)))
-        for k, v in six.iteritems(filter_dict)
+        for k, v in filter_dict.items()
     )
 
 
 def _project_by_spec(doc, proj_spec, is_include):
     output = {}
-    for key, value in six.iteritems(doc):
+    for key, value in doc.items():
         if key not in proj_spec:
             if not is_include:
                 output[key] = value
@@ -1327,7 +1516,7 @@ def _handle_project_stage(in_collection, unused_database, options):
     # Compute new values for each field, except inclusion/exclusions that are
     # handled in one final step.
     new_fields_collection = None
-    for field, value in six.iteritems(options):
+    for field, value in options.items():
         if method is None and (field != '_id' or value):
             method = 'include' if value else 'exclude'
         elif method == 'include' and not value and field != '_id':
@@ -1376,7 +1565,7 @@ def _handle_add_fields_stage(in_collection, unused_database, options):
         raise OperationFailure(
             'Invalid $addFields :: caused by :: specification must have at least one field')
     out_collection = [dict(doc) for doc in in_collection]
-    for field, value in six.iteritems(options):
+    for field, value in options.items():
         for in_doc, out_doc in zip(in_collection, out_collection):
             try:
                 out_value = _parse_expression(value, in_doc, ignore_missing_keys=True)
@@ -1467,14 +1656,14 @@ def process_pipeline(collection, database, pipeline, session):
         raise NotImplementedError('Mongomock does not handle sessions yet')
 
     for stage in pipeline:
-        for operator, options in six.iteritems(stage):
+        for operator, options in stage.items():
             try:
                 handler = _PIPELINE_HANDLERS[operator]
             except KeyError as err:
-                raise_from(NotImplementedError(
+                raise NotImplementedError(
                     '%s is not a valid operator for the aggregation pipeline. '
                     'See http://docs.mongodb.org/manual/meta/aggregation-quick-reference/ '
-                    'for a complete list of valid operators.' % operator), err)
+                    'for a complete list of valid operators.' % operator) from err
             if not handler:
                 raise NotImplementedError(
                     "Although '%s' is a valid operator for the aggregation pipeline, it is "

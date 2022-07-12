@@ -1,15 +1,14 @@
 """Tools for specifying BSON codec options."""
 
 import collections
-from distutils import version  # pylint: disable=no-name-in-module
+from packaging import version
+
+from mongomock import helpers
 
 try:
     from bson import codec_options
-    import pymongo
-    _PYMONGO_VERSION = version.LooseVersion(pymongo.version)
 except ImportError:
     codec_options = None
-    _PYMONGO_VERSION = version.LooseVersion('0.0')
 
 
 class TypeRegistry(object):
@@ -20,11 +19,18 @@ _FIELDS = (
     'document_class', 'tz_aware', 'uuid_representation', 'unicode_decode_error_handler', 'tzinfo',
 )
 
-if _PYMONGO_VERSION >= version.LooseVersion('3.8'):
+if codec_options and helpers.PYMONGO_VERSION >= version.parse('3.8'):
     _DEFAULT_TYPE_REGISTRY = codec_options.TypeRegistry()
     _FIELDS = _FIELDS + ('type_registry',)
 else:
     _DEFAULT_TYPE_REGISTRY = TypeRegistry()
+
+# New default in Pymongo v4:
+# https://pymongo.readthedocs.io/en/stable/examples/uuid.html#unspecified
+if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+    _DEFAULT_UUID_REPRESENTATION = 0
+else:
+    _DEFAULT_UUID_REPRESENTATION = 3
 
 
 class CodecOptions(collections.namedtuple('CodecOptions', _FIELDS)):
@@ -43,8 +49,8 @@ class CodecOptions(collections.namedtuple('CodecOptions', _FIELDS)):
             raise TypeError('tz_aware must be True or False')
 
         if uuid_representation is None:
-            uuid_representation = 3
-        if uuid_representation != 3:
+            uuid_representation = _DEFAULT_UUID_REPRESENTATION
+        if uuid_representation != _DEFAULT_UUID_REPRESENTATION:
             raise NotImplementedError('Mongomock does not handle custom uuid_representation yet')
 
         if unicode_decode_error_handler not in ('strict', None):

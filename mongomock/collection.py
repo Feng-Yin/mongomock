@@ -1,16 +1,13 @@
 from __future__ import division
 import collections
 from collections import OrderedDict
-try:
-    from collections.abc import Iterable, Mapping, MutableMapping
-except ImportError:
-    from collections import Iterable, Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping
 import copy
-from distutils import version  # pylint: disable=no-name-in-module
 import functools
 import itertools
 import json
 import math
+from packaging import version
 import time
 import warnings
 
@@ -39,12 +36,6 @@ except ImportError:
     from mongomock.read_preferences import PRIMARY as _READ_PREFERENCE_PRIMARY
 
 from sentinels import NOTHING
-from six import iteritems
-from six import iterkeys
-from six import PY3
-from six import raise_from
-from six import string_types
-from six import text_type
 
 
 import mongomock  # Used for utcnow - please see https://github.com/mongomock/mongomock#utcnow
@@ -70,11 +61,6 @@ try:
     from pymongo.read_concern import ReadConcern
 except ImportError:
     from mongomock.read_concern import ReadConcern
-
-if hasattr(time, 'perf_counter'):
-    _get_perf_counter = time.perf_counter
-else:
-    _get_perf_counter = time.clock
 
 _KwargOption = collections.namedtuple('KwargOption', ['typename', 'default', 'attrs'])
 
@@ -203,7 +189,7 @@ def _combine_projection_spec(projection_fields_spec):
     """
 
     tmp_spec = OrderedDict()
-    for f, v in iteritems(projection_fields_spec):
+    for f, v in projection_fields_spec.items():
         if '.' not in f:
             if isinstance(tmp_spec.get(f), dict):
                 if not v:
@@ -223,7 +209,7 @@ def _combine_projection_spec(projection_fields_spec):
             tmp_spec[base_field][new_field] = v
 
     combined_spec = OrderedDict()
-    for f, v in iteritems(tmp_spec):
+    for f, v in tmp_spec.items():
         if isinstance(v, dict):
             combined_spec[f] = _combine_projection_spec(v)
         else:
@@ -233,34 +219,39 @@ def _combine_projection_spec(projection_fields_spec):
 
 
 def _project_by_spec(doc, combined_projection_spec, is_include, container):
+    if '$' in combined_projection_spec:
+        if is_include:
+            raise NotImplementedError('Positional projection is not implemented in mongomock')
+        raise OperationFailure('Cannot exclude array elements with the positional operator')
+
     doc_copy = container()
 
-    if not is_include:
-        for key, val in iteritems(doc):
-            doc_copy[key] = val
-
-    for key, spec in iteritems(combined_projection_spec):
-        if key == '$':
-            if is_include:
-                raise NotImplementedError('Positional projection is not implemented in mongomock')
-            raise OperationFailure('Cannot exclude array elements with the positional operator')
-        if key not in doc:
-            continue
-
+    for key, val in doc.items():
+        spec = combined_projection_spec.get(key, NOTHING)
         if isinstance(spec, dict):
-            sub = doc[key]
-            if isinstance(sub, (list, tuple)):
+            if isinstance(val, (list, tuple)):
                 doc_copy[key] = [_project_by_spec(sub_doc, spec, is_include, container)
-                                 for sub_doc in sub]
-            elif isinstance(sub, dict):
-                doc_copy[key] = _project_by_spec(sub, spec, is_include, container)
-        else:
-            if is_include:
-                doc_copy[key] = doc[key]
-            else:
-                doc_copy.pop(key, None)
+                                 for sub_doc in val]
+            elif isinstance(val, dict):
+                doc_copy[key] = _project_by_spec(val, spec, is_include, container)
+        elif (is_include and spec is not NOTHING) or (not is_include and spec is NOTHING):
+            doc_copy[key] = _copy_field(val, container)
 
     return doc_copy
+
+
+def _copy_field(obj, container):
+    if isinstance(obj, list):
+        new = []
+        for item in obj:
+            new.append(_copy_field(item, container))
+        return new
+    if isinstance(obj, dict):
+        new = container()
+        for key, value in obj.items():
+            new[key] = _copy_field(value, container)
+        return new
+    return copy.copy(obj)
 
 
 class BulkOperationBuilder(object):
@@ -360,8 +351,8 @@ class BulkOperationBuilder(object):
     def add_update(self, selector, doc, multi=False, upsert=False, collation=None,
                    array_filters=None, hint=None):
         if array_filters:
-            raise NotImplementedError(
-                'Array filters are not implemented in mongomock yet.')
+            raise_not_implemented(
+                'array_filters', 'Array filters are not implemented in mongomock yet.')
         write_operation = BulkWriteOperation(self, selector, is_upsert=upsert)
         write_operation.register_update_op(doc, multi, hint=hint)
 
@@ -402,14 +393,18 @@ class Collection(object):
                 (self.__class__.__name__, attr, self.name, attr, self.name, attr))
         return self.__getitem__(attr)
 
+    def __call__(self, *args, **kwargs):
+        name = self._name if '.' not in self._name else self._name.split('.')[-1]
+        raise TypeError(
+            "'Collection' object is not callable. If you meant to call the '%s' method on a "
+            "'Collection' object it is failing because no such method exists." % name)
+
     def __eq__(self, other):
         if isinstance(other, self.__class__):
             return self.database == other.database and self.name == other.name
         return NotImplemented
 
-    if PY3 and (
-        not helpers.PYMONGO_VERSION or helpers.PYMONGO_VERSION >= version.LooseVersion('3.12')
-    ):
+    if helpers.PYMONGO_VERSION >= version.parse('3.12'):
         def __hash__(self):
             return hash((self.database, self.name))
 
@@ -445,12 +440,13 @@ class Collection(object):
         return BulkOperationBuilder(
             self, ordered=True, bypass_document_validation=bypass_document_validation)
 
-    def insert(self, data, manipulate=True, check_keys=True,
-               continue_on_error=False, **kwargs):
-        warnings.warn('insert is deprecated. Use insert_one or insert_many '
-                      'instead.', DeprecationWarning, stacklevel=2)
-        validate_write_concern_params(**kwargs)
-        return self._insert(data)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def insert(self, data, manipulate=True, check_keys=True,
+                   continue_on_error=False, **kwargs):
+            warnings.warn('insert is deprecated. Use insert_one or insert_many '
+                          'instead.', DeprecationWarning, stacklevel=2)
+            validate_write_concern_params(**kwargs)
+            return self._insert(data)
 
     def insert_one(self, document, bypass_document_validation=False, session=None):
         return self._insert_one(document, bypass_document_validation, session)
@@ -504,7 +500,7 @@ class Collection(object):
                 })
             return results
 
-        if not all(isinstance(k, string_types) for k in data):
+        if not all(isinstance(k, str) for k in data):
             raise ValueError('Document keys must be strings')
 
         if BSON:
@@ -540,6 +536,7 @@ class Collection(object):
                 continue
             unique = index.get('key')
             is_sparse = index.get('sparse')
+            partial_filter_expression = index.get('partialFilterExpression')
             find_kwargs = {}
             for key, _ in unique:
                 try:
@@ -548,12 +545,14 @@ class Collection(object):
                     find_kwargs[key] = None
             if is_sparse and set(find_kwargs.values()) == {None}:
                 continue
+            if partial_filter_expression is not None:
+                find_kwargs = {'$and': [partial_filter_expression, find_kwargs]}
             answer_count = len(list(self._iter_documents(find_kwargs)))
             if answer_count > 1:
                 raise DuplicateKeyError('E11000 Duplicate Key Error', 11000)
 
     def _internalize_dict(self, d):
-        return {k: copy.deepcopy(v) for k, v in iteritems(d)}
+        return {k: copy.deepcopy(v) for k, v in d.items()}
 
     def _has_key(self, doc, key):
         key_parts = key.split('.')
@@ -565,24 +564,26 @@ class Collection(object):
         return True
 
     def update_one(
-            self, filter, update, upsert=False, bypass_document_validation=False, hint=None,
-            session=None, collation=None):
+            self, filter, update, upsert=False, bypass_document_validation=False, collation=None,
+            array_filters=None, hint=None, session=None, let=None):
         if not bypass_document_validation:
             validate_ok_for_update(update)
         return UpdateResult(
             self._update(
-                filter, update, upsert=upsert, hint=hint, session=session, collation=collation),
+                filter, update, upsert=upsert, hint=hint, session=session, collation=collation,
+                array_filters=array_filters, let=let),
             acknowledged=True)
 
     def update_many(
-            self, filter, update, upsert=False, bypass_document_validation=False, hint=None,
-            session=None, collation=None):
+            self, filter, update, upsert=False, array_filters=None,
+            bypass_document_validation=False, collation=None, hint=None,
+            session=None, let=None):
         if not bypass_document_validation:
             validate_ok_for_update(update)
         return UpdateResult(
             self._update(
                 filter, update, upsert=upsert, multi=True, hint=hint, session=session,
-                collation=collation),
+                collation=collation, array_filters=array_filters, let=let),
             acknowledged=True)
 
     def replace_one(
@@ -594,16 +595,17 @@ class Collection(object):
             self._update(filter, replacement, upsert=upsert, hint=hint, session=session),
             acknowledged=True)
 
-    def update(self, spec, document, upsert=False, manipulate=False,
-               multi=False, check_keys=False, **kwargs):
-        warnings.warn('update is deprecated. Use replace_one, update_one or '
-                      'update_many instead.', DeprecationWarning, stacklevel=2)
-        return self._update(spec, document, upsert, manipulate, multi,
-                            check_keys, **kwargs)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def update(self, spec, document, upsert=False, manipulate=False,
+                   multi=False, check_keys=False, **kwargs):
+            warnings.warn('update is deprecated. Use replace_one, update_one or '
+                          'update_many instead.', DeprecationWarning, stacklevel=2)
+            return self._update(spec, document, upsert, manipulate, multi,
+                                check_keys, **kwargs)
 
     def _update(self, spec, document, upsert=False, manipulate=False,
                 multi=False, check_keys=False, hint=None, session=None,
-                collation=None, **kwargs):
+                collation=None, let=None, array_filters=None, **kwargs):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
         if hint:
@@ -615,16 +617,26 @@ class Collection(object):
                 'collation',
                 'The collation argument of update is valid but has not been implemented in '
                 'mongomock yet')
+        if array_filters:
+            raise_not_implemented(
+                'array_filters', 'Array filters are not implemented in mongomock yet.')
+        if let:
+            raise_not_implemented(
+                'let',
+                'The let argument of update is valid but has not been implemented in mongomock '
+                'yet')
         spec = helpers.patch_datetime_awareness_in_document(spec)
         document = helpers.patch_datetime_awareness_in_document(document)
         validate_is_mapping('spec', spec)
         validate_is_mapping('document', document)
-        for operator in _updaters:
-            if not document.get(operator, True):
-                raise WriteError(
-                    "'%s' is empty. You must specify a field like so: {%s: {<field>: ...}}"
-                    % (operator, operator),
-                )
+
+        if self.database.client.server_info()['versionArray'] < [5]:
+            for operator in _updaters:
+                if not document.get(operator, True):
+                    raise WriteError(
+                        "'%s' is empty. You must specify a field like so: {%s: {<field>: ...}}"
+                        % (operator, operator),
+                    )
 
         updated_existing = False
         upserted_id = None
@@ -656,14 +668,14 @@ class Collection(object):
             num_matched += 1
             first = True
             subdocument = None
-            for k, v in iteritems(document):
+            for k, v in document.items():
                 if k in _updaters:
                     updater = _updaters[k]
                     subdocument = self._update_document_fields_with_positional_awareness(
                         existing_document, v, spec, updater, subdocument)
 
                 elif k == '$rename':
-                    for src, dst in iteritems(v):
+                    for src, dst in v.items():
                         if '.' in src or '.' in dst:
                             raise NotImplementedError(
                                 'Using the $rename operator with dots is a valid MongoDB '
@@ -683,7 +695,7 @@ class Collection(object):
                         existing_document, v, spec, _current_date_updater, subdocument)
 
                 elif k == '$addToSet':
-                    for field, value in iteritems(v):
+                    for field, value in v.items():
                         nested_field_list = field.rsplit('.')
                         if len(nested_field_list) == 1:
                             if field not in existing_document:
@@ -704,10 +716,16 @@ class Collection(object):
                             # create nested attributes if they do not exist
                             subdocument = existing_document
                             for field_part in nested_field_list[:-1]:
+                                if field_part == '$':
+                                    break
                                 if field_part not in subdocument:
                                     subdocument[field_part] = {}
 
                                 subdocument = subdocument[field_part]
+
+                            # get subdocument with $ oprator support
+                            subdocument, _ = self._get_subdocument(
+                                existing_document, spec, nested_field_list)
 
                             # we're pushing a list
                             push_results = []
@@ -725,7 +743,7 @@ class Collection(object):
 
                             subdocument[nested_field_list[-1]] = push_results
                 elif k == '$pull':
-                    for field, value in iteritems(v):
+                    for field, value in v.items():
                         nested_field_list = field.rsplit('.')
                         # nested fields includes a positional element
                         # need to find that element
@@ -739,7 +757,7 @@ class Collection(object):
                             # and the last subdoc should be an array
                             for obj in subdocument[nested_field_list[-1]]:
                                 if isinstance(obj, dict):
-                                    for pull_key, pull_value in iteritems(value):
+                                    for pull_key, pull_value in value.items():
                                         if obj[pull_key] != pull_value:
                                             pull_results.append(obj)
                                     continue
@@ -776,7 +794,7 @@ class Collection(object):
                                     if value == obj:
                                         arr.remove(obj)
                 elif k == '$pullAll':
-                    for field, value in iteritems(v):
+                    for field, value in v.items():
                         nested_field_list = field.rsplit('.')
                         if len(nested_field_list) == 1:
                             if field in existing_document:
@@ -785,18 +803,15 @@ class Collection(object):
                                     obj for obj in arr if obj not in value]
                             continue
                         else:
-                            subdocument = existing_document
-                            for nested_field in nested_field_list[:-1]:
-                                if nested_field not in subdocument:
-                                    break
-                                subdocument = subdocument[nested_field]
+                            subdocument, _ = self._get_subdocument(
+                                existing_document, spec, nested_field_list)
 
                             if nested_field_list[-1] in subdocument:
                                 arr = subdocument[nested_field_list[-1]]
                                 subdocument[nested_field_list[-1]] = [
                                     obj for obj in arr if obj not in value]
                 elif k == '$push':
-                    for field, value in iteritems(v):
+                    for field, value in v.items():
                         # Find the place where to push.
                         nested_field_list = field.rsplit('.')
                         subdocument, field = self._get_subdocument(
@@ -904,13 +919,13 @@ class Collection(object):
                 break
 
         return {
-            text_type('connectionId'): self.database.client._id,
-            text_type('err'): None,
-            text_type('n'): num_matched,
-            text_type('nModified'): num_updated if updated_existing else 0,
-            text_type('ok'): 1,
-            text_type('upserted'): upserted_id,
-            text_type('updatedExisting'): updated_existing,
+            'connectionId': self.database.client._id,
+            'err': None,
+            'n': num_matched,
+            'nModified': num_updated if updated_existing else 0,
+            'ok': 1,
+            'upserted': upserted_id,
+            'updatedExisting': updated_existing,
         }
 
     def _get_subdocument(self, existing_document, spec, nested_field_list):
@@ -969,7 +984,7 @@ class Collection(object):
     def _expand_dots(self, doc):
         expanded = {}
         paths = {}
-        for k, v in iteritems(doc):
+        for k, v in doc.items():
 
             def _raise_incompatible(subkey):
                 raise WriteError(
@@ -998,7 +1013,7 @@ class Collection(object):
         if not doc or not isinstance(doc, dict):
             return doc, False
         new_doc = OrderedDict()
-        for k, v in iteritems(doc):
+        for k, v in doc.items():
             if k == '$eq':
                 return v, False
             if k.startswith('$'):
@@ -1012,27 +1027,27 @@ class Collection(object):
              no_cursor_timeout=False, cursor_type=None, sort=None,
              allow_partial_results=False, oplog_replay=False, modifiers=None,
              batch_size=0, manipulate=True, collation=None, session=None,
-             max_time_ms=None, **kwargs):
+             max_time_ms=None, allow_disk_use=False, **kwargs):
         return self._find(filter, projection, skip, limit,
              no_cursor_timeout, cursor_type, sort,
              allow_partial_results, oplog_replay, modifiers,
              batch_size, manipulate, collation, session,
-             max_time_ms, **kwargs)
+             max_time_ms, allow_disk_use, **kwargs)
 
     def _find(self, filter=None, projection=None, skip=0, limit=0,
              no_cursor_timeout=False, cursor_type=None, sort=None,
              allow_partial_results=False, oplog_replay=False, modifiers=None,
              batch_size=0, manipulate=True, collation=None, session=None,
-             max_time_ms=None, **kwargs):
+             max_time_ms=None, allow_disk_use=False, **kwargs):
         spec = filter
         if spec is None:
             spec = {}
         validate_is_mapping('filter', spec)
-        for kwarg, value in iteritems(kwargs):
+        for kwarg, value in kwargs.items():
             if value:
                 raise OperationFailure("Unrecognized field '%s'" % kwarg)
         return Cursor(self, spec, sort, projection, skip, limit,
-                      collation=collation).max_time_ms(max_time_ms)
+                      collation=collation).max_time_ms(max_time_ms).allow_disk_use(allow_disk_use)
 
     def _get_dataset(self, spec, sort, fields, as_class):
         dataset = self._iter_documents(spec)
@@ -1051,24 +1066,11 @@ class Collection(object):
         for document in dataset:
             yield self._copy_only_fields(document, fields, as_class)
 
-    def _copy_field(self, obj, container):
-        if isinstance(obj, list):
-            new = []
-            for item in obj:
-                new.append(self._copy_field(item, container))
-            return new
-        if isinstance(obj, dict):
-            new = container()
-            for key, value in obj.items():
-                new[key] = self._copy_field(value, container)
-            return new
-        return copy.copy(obj)
-
     def _extract_projection_operators(self, fields):
         """Removes and returns fields with projection operators."""
         result = {}
         allowed_projection_operators = {'$elemMatch', '$slice'}
-        for key, value in iteritems(fields):
+        for key, value in fields.items():
             if isinstance(value, dict):
                 for op in value:
                     if op not in allowed_projection_operators:
@@ -1082,7 +1084,7 @@ class Collection(object):
 
     def _apply_projection_operators(self, ops, doc, doc_copy):
         """Applies projection operators to copied document."""
-        for field, op in iteritems(ops):
+        for field, op in ops.items():
             if field not in doc_copy:
                 if field in doc:
                     # field was not copied yet (since we are in include mode)
@@ -1146,8 +1148,9 @@ class Collection(object):
     def _copy_only_fields(self, doc, fields, container):
         """Copy only the specified fields."""
 
-        if fields is None:
-            return self._copy_field(doc, container)
+        # https://pymongo.readthedocs.io/en/stable/migrate-to-pymongo4.html#collection-find-returns-entire-document-with-empty-projection
+        if fields is None or not fields and helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            return _copy_field(doc, container)
 
         if not fields:
             fields = {'_id': 1}
@@ -1173,7 +1176,7 @@ class Collection(object):
             if id_value == 1:
                 doc_copy = container()
             else:
-                doc_copy = self._copy_field(doc, container)
+                doc_copy = _copy_field(doc, container)
         else:
             doc_copy = _project_by_spec(
                 doc, _combine_projection_spec(fields),
@@ -1191,19 +1194,19 @@ class Collection(object):
 
         # time to apply the projection operators and put back their fields
         self._apply_projection_operators(projection_operators, doc, doc_copy)
-        for field, op in iteritems(projection_operators):
+        for field, op in projection_operators.items():
             fields[field] = op
         return doc_copy
 
     def _update_document_fields(self, doc, fields, updater):
         """Implements the $set behavior on an existing document"""
-        for k, v in iteritems(fields):
+        for k, v in fields.items():
             self._update_document_single_field(doc, k, v, updater)
 
     def _update_document_fields_positional(self, doc, fields, spec, updater,
                                            subdocument=None):
         """Implements the $set behavior on an existing document"""
-        for k, v in iteritems(fields):
+        for k, v in fields.items():
             if '$' in k:
 
                 field_name_parts = k.split('.')
@@ -1212,9 +1215,9 @@ class Collection(object):
                     subspec = spec
                     for part in field_name_parts[:-1]:
                         if part == '$':
-                            subspec = subspec.get('$elemMatch', subspec)
+                            subspec_dollar = subspec.get('$elemMatch', subspec)
                             for item in current_doc:
-                                if filter_applies(subspec, item):
+                                if filter_applies(subspec_dollar, item):
                                     current_doc = item
                                     break
                             continue
@@ -1233,7 +1236,8 @@ class Collection(object):
                     subdocument = current_doc
                     if field_name_parts[-1] == '$' and isinstance(subdocument, list):
                         for i, doc in enumerate(subdocument):
-                            if filter_applies(subspec, doc):
+                            subspec_dollar = subspec.get('$elemMatch', subspec)
+                            if filter_applies(subspec_dollar, doc):
                                 subdocument[i] = v
                                 break
                         continue
@@ -1247,7 +1251,7 @@ class Collection(object):
 
     def _update_document_fields_with_positional_awareness(self, existing_document, v, spec,
                                                           updater, subdocument):
-        positional = any('$' in key for key in iterkeys(v))
+        positional = any('$' in key for key in v.keys())
 
         if positional:
             return self._update_document_fields_positional(
@@ -1322,15 +1326,16 @@ class Collection(object):
         return self._find_and_modify(filter, projection, update, upsert,
                                      sort, return_document, **kwargs)
 
-    def find_and_modify(self, query={}, update=None, upsert=False, sort=None,
-                        full_response=False, manipulate=False, fields=None, **kwargs):
-        warnings.warn('find_and_modify is deprecated, use find_one_and_delete'
-                      ', find_one_and_replace, or find_one_and_update instead',
-                      DeprecationWarning, stacklevel=2)
-        if 'projection' in kwargs:
-            raise TypeError("find_and_modify() got an unexpected keyword argument 'projection'")
-        return self._find_and_modify(query, update=update, upsert=upsert,
-                                     sort=sort, projection=fields, **kwargs)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def find_and_modify(self, query={}, update=None, upsert=False, sort=None,
+                            full_response=False, manipulate=False, fields=None, **kwargs):
+            warnings.warn('find_and_modify is deprecated, use find_one_and_delete'
+                          ', find_one_and_replace, or find_one_and_update instead',
+                          DeprecationWarning, stacklevel=2)
+            if 'projection' in kwargs:
+                raise TypeError("find_and_modify() got an unexpected keyword argument 'projection'")
+            return self._find_and_modify(query, update=update, upsert=upsert,
+                                         sort=sort, projection=fields, **kwargs)
 
     def _find_and_modify(self, query, projection=None, update=None,
                          upsert=False, sort=None,
@@ -1366,16 +1371,18 @@ class Collection(object):
             return self._find_one(query, projection)
         return old
 
-    def save(self, to_save, manipulate=True, check_keys=True, **kwargs):
-        warnings.warn('save is deprecated. Use insert_one or replace_one '
-                      'instead', DeprecationWarning, stacklevel=2)
-        validate_is_mutable_mapping('to_save', to_save)
-        validate_write_concern_params(**kwargs)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def save(self, to_save, manipulate=True, check_keys=True, **kwargs):
+            warnings.warn('save is deprecated. Use insert_one or replace_one '
+                          'instead', DeprecationWarning, stacklevel=2)
+            validate_is_mutable_mapping('to_save', to_save)
+            validate_write_concern_params(**kwargs)
 
-        if '_id' not in to_save:
-            return self.insert(to_save)
-        self._update({'_id': to_save['_id']}, to_save, True, manipulate, check_keys=True, **kwargs)
-        return to_save.get('_id', None)
+            if '_id' not in to_save:
+                return self.insert(to_save)
+            self._update(
+                {'_id': to_save['_id']}, to_save, True, manipulate, check_keys=True, **kwargs)
+            return to_save.get('_id', None)
 
     def delete_one(self, filter, collation=None, hint=None, session=None):
         return self._delete_one(filter, collation, hint, session)
@@ -1428,25 +1435,26 @@ class Collection(object):
             'err': None,
         }
 
-    def remove(self, spec_or_id=None, multi=True, **kwargs):
-        warnings.warn('remove is deprecated. Use delete_one or delete_many '
-                      'instead.', DeprecationWarning, stacklevel=2)
-        validate_write_concern_params(**kwargs)
-        return self._delete(spec_or_id, multi=multi)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def remove(self, spec_or_id=None, multi=True, **kwargs):
+            warnings.warn('remove is deprecated. Use delete_one or delete_many '
+                          'instead.', DeprecationWarning, stacklevel=2)
+            validate_write_concern_params(**kwargs)
+            return self._delete(spec_or_id, multi=multi)
 
-    def count(self, filter=None, **kwargs):
-        warnings.warn(
-            'count is deprecated. Use estimated_document_count or '
-            'count_documents instead. Please note that $where must be replaced '
-            'by $expr, $near must be replaced by $geoWithin with $center, and '
-            '$nearSphere must be replaced by $geoWithin with $centerSphere',
-            DeprecationWarning, stacklevel=2)
-        if kwargs.pop('session', None):
-            raise_not_implemented('session', 'Mongomock does not handle sessions yet')
-        if filter is None:
-            return len(self._store)
-        spec = helpers.patch_datetime_awareness_in_document(filter)
-        return len(list(self._iter_documents(spec)))
+        def count(self, filter=None, **kwargs):
+            warnings.warn(
+                'count is deprecated. Use estimated_document_count or '
+                'count_documents instead. Please note that $where must be replaced '
+                'by $expr, $near must be replaced by $geoWithin with $center, and '
+                '$nearSphere must be replaced by $geoWithin with $centerSphere',
+                DeprecationWarning, stacklevel=2)
+            if kwargs.pop('session', None):
+                raise_not_implemented('session', 'Mongomock does not handle sessions yet')
+            if filter is None:
+                return len(self._store)
+            spec = helpers.patch_datetime_awareness_in_document(filter)
+            return len(list(self._iter_documents(spec)))
 
     def count_documents(self, filter, **kwargs):
         return self._count_documents(filter, **kwargs)
@@ -1484,19 +1492,25 @@ class Collection(object):
     def _estimated_document_count(self, **kwargs):
         if kwargs.pop('session', None):
             raise ConfigurationError('estimated_document_count does not support sessions')
-        unknown_kwargs = set(kwargs) - {'skip', 'limit', 'maxTimeMS', 'hint'}
+        unknown_kwargs = set(kwargs) - {'limit', 'maxTimeMS', 'hint'}
+        if self.database.client.server_info()['versionArray'] < [5]:
+            unknown_kwargs.discard('skip')
         if unknown_kwargs:
             raise OperationFailure(
                 "BSON field 'count.%s' is an unknown field." % list(unknown_kwargs)[0])
         return self._count_documents({}, **kwargs)
 
     def drop(self, session=None):
+        return self._drop(session)
+    
+    def _drop(self, session=None):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
         self.database.drop_collection(self.name)
 
-    def ensure_index(self, key_or_list, cache_for=300, **kwargs):
-        return self._create_index(key_or_list, cache_for, **kwargs)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def ensure_index(self, key_or_list, cache_for=300, **kwargs):
+            return self._create_index(key_or_list, cache_for, **kwargs)
 
     def create_index(self, key_or_list, cache_for=300, session=None, **kwargs):
         return self._create_index(key_or_list, cache_for, session, **kwargs)
@@ -1516,6 +1530,8 @@ class Collection(object):
             index_dict['unique'] = True
         if 'expireAfterSeconds' in kwargs and kwargs['expireAfterSeconds'] is not None:
             index_dict['expireAfterSeconds'] = kwargs.pop('expireAfterSeconds')
+        if 'partialFilterExpression' in kwargs and kwargs['partialFilterExpression'] is not None:
+            index_dict['partialFilterExpression'] = kwargs.pop('partialFilterExpression')
 
         existing_index = self._store.indexes.get(index_name)
         if existing_index and index_dict != existing_index:
@@ -1526,7 +1542,8 @@ class Collection(object):
         if is_unique:
             indexed = set()
             indexed_list = []
-            for doc in self._store.documents:
+            documents_gen = self._store.documents
+            for doc in documents_gen:
                 index = []
                 for key, unused_order in index_list:
                     try:
@@ -1540,12 +1557,15 @@ class Collection(object):
                 index = tuple(index)
                 try:
                     if index in indexed:
-                        raise DuplicateKeyError('E11000 Duplicate Key Error', 11000)
+                        # Need to throw this inside the generator so it can clean the locks
+                        documents_gen.throw(
+                            DuplicateKeyError('E11000 Duplicate Key Error', 11000), None, None)
                     indexed.add(index)
                 except TypeError as err:
                     # index is not hashable.
                     if index in indexed_list:
-                        raise_from(DuplicateKeyError('E11000 Duplicate Key Error', 11000), err)
+                        documents_gen.throw(
+                            DuplicateKeyError('E11000 Duplicate Key Error', 11000), None, err)
                     indexed_list.append(index)
 
         self._store.create_index(index_name, index_dict)
@@ -1553,13 +1573,16 @@ class Collection(object):
         return index_name
 
     def create_indexes(self, indexes, session=None):
+        return self._create_indexes(indexes, session)
+
+    def _create_indexes(self, indexes, session=None):
         for index in indexes:
             if not isinstance(index, IndexModel):
                 raise TypeError(
                     '%s is not an instance of pymongo.operations.IndexModel' % index)
 
         return [
-            self.create_index(
+            self._create_index(
                 index.document['key'].items(),
                 session=session,
                 expireAfterSeconds=index.document.get('expireAfterSeconds'),
@@ -1579,16 +1602,17 @@ class Collection(object):
         try:
             self._store.drop_index(name)
         except KeyError as err:
-            raise_from(OperationFailure('index not found with name [%s]' % name), err)
+            raise OperationFailure('index not found with name [%s]' % name) from err
 
     def drop_indexes(self, session=None):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
         self._store.indexes = {}
 
-    def reindex(self, session=None):
-        if session:
-            raise_not_implemented('session', 'Mongomock does not handle sessions yet')
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def reindex(self, session=None):
+            if session:
+                raise_not_implemented('session', 'Mongomock does not handle sessions yet')
 
     def _list_all_indexes(self):
         if not self._store.is_created:
@@ -1615,178 +1639,181 @@ class Collection(object):
             for name, index in self._list_all_indexes()
         }
 
-    def map_reduce(self, map_func, reduce_func, out, full_response=False,
-                   query=None, limit=0, session=None):
-        return self._map_reduce(map_func, reduce_func, out, full_response, query, limit, session)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def map_reduce(self, map_func, reduce_func, out, full_response=False,
+                       query=None, limit=0, session=None):
+            return self._map_reduce(map_func, reduce_func, out, full_response,
+                       query, limit, session)
 
-    def _map_reduce(self, map_func, reduce_func, out, full_response=False,
-                   query=None, limit=0, session=None):
-        if execjs is None:
-            raise NotImplementedError(
-                'PyExecJS is required in order to run Map-Reduce. '
-                "Use 'pip install pyexecjs pymongo' to support Map-Reduce mock."
-            )
-        if session:
-            raise_not_implemented('session', 'Mongomock does not handle sessions yet')
-        if limit == 0:
-            limit = None
-        start_time = _get_perf_counter()  # pylint: disable=deprecated-method
-        out_collection = None
-        reduced_rows = None
-        full_dict = {
-            'counts': {
-                'input': 0,
-                'reduce': 0,
-                'emit': 0,
-                'output': 0},
-            'timeMillis': 0,
-            'ok': 1.0,
-            'result': None}
-        map_ctx = execjs.compile('''
-            function doMap(fnc, docList) {
-                var mappedDict = {};
-                function emit(key, val) {
-                    if (key['$oid']) {
-                        mapped_key = '$oid' + key['$oid'];
+        def _map_reduce(self, map_func, reduce_func, out, full_response=False,
+                       query=None, limit=0, session=None):
+            if execjs is None:
+                raise NotImplementedError(
+                    'PyExecJS is required in order to run Map-Reduce. '
+                    "Use 'pip install pyexecjs pymongo' to support Map-Reduce mock."
+                )
+            if session:
+                raise_not_implemented('session', 'Mongomock does not handle sessions yet')
+            if limit == 0:
+                limit = None
+            start_time = time.perf_counter()
+            out_collection = None
+            reduced_rows = None
+            full_dict = {
+                'counts': {
+                    'input': 0,
+                    'reduce': 0,
+                    'emit': 0,
+                    'output': 0},
+                'timeMillis': 0,
+                'ok': 1.0,
+                'result': None}
+            map_ctx = execjs.compile('''
+                function doMap(fnc, docList) {
+                    var mappedDict = {};
+                    function emit(key, val) {
+                        if (key['$oid']) {
+                            mapped_key = '$oid' + key['$oid'];
+                        }
+                        else {
+                            mapped_key = key;
+                        }
+                        if(!mappedDict[mapped_key]) {
+                            mappedDict[mapped_key] = [];
+                        }
+                        mappedDict[mapped_key].push(val);
                     }
-                    else {
-                        mapped_key = key;
+                    mapper = eval('('+fnc+')');
+                    var mappedList = new Array();
+                    for(var i=0; i<docList.length; i++) {
+                        var thisDoc = eval('('+docList[i]+')');
+                        var mappedVal = (mapper).call(thisDoc);
                     }
-                    if(!mappedDict[mapped_key]) {
-                        mappedDict[mapped_key] = [];
+                    return mappedDict;
+                }
+            ''')
+            reduce_ctx = execjs.compile('''
+                function doReduce(fnc, docList) {
+                    var reducedList = new Array();
+                    reducer = eval('('+fnc+')');
+                    for(var key in docList) {
+                        var reducedVal = {'_id': key,
+                                'value': reducer(key, docList[key])};
+                        reducedList.push(reducedVal);
                     }
-                    mappedDict[mapped_key].push(val);
+                    return reducedList;
                 }
-                mapper = eval('('+fnc+')');
-                var mappedList = new Array();
-                for(var i=0; i<docList.length; i++) {
-                    var thisDoc = eval('('+docList[i]+')');
-                    var mappedVal = (mapper).call(thisDoc);
-                }
-                return mappedDict;
-            }
-        ''')
-        reduce_ctx = execjs.compile('''
-            function doReduce(fnc, docList) {
-                var reducedList = new Array();
-                reducer = eval('('+fnc+')');
-                for(var key in docList) {
-                    var reducedVal = {'_id': key,
-                            'value': reducer(key, docList[key])};
-                    reducedList.push(reducedVal);
-                }
-                return reducedList;
-            }
-        ''')
-        doc_list = [json.dumps(doc, default=json_util.default)
-                    for doc in self._find(query)]
-        mapped_rows = map_ctx.call('doMap', map_func, doc_list)
-        reduced_rows = reduce_ctx.call('doReduce', reduce_func, mapped_rows)[:limit]
-        for reduced_row in reduced_rows:
-            if reduced_row['_id'].startswith('$oid'):
-                reduced_row['_id'] = ObjectId(reduced_row['_id'][4:])
-        reduced_rows = sorted(reduced_rows, key=lambda x: x['_id'])
-        if full_response:
-            full_dict['counts']['input'] = len(doc_list)
-            for key in mapped_rows.keys():
-                emit_count = len(mapped_rows[key])
-                full_dict['counts']['emit'] += emit_count
-                if emit_count > 1:
-                    full_dict['counts']['reduce'] += 1
-            full_dict['counts']['output'] = len(reduced_rows)
-        if isinstance(out, (string_types, bytes)):
-            out_collection = getattr(self.database, out)
-            out_collection.drop()
-            out_collection.insert(reduced_rows)
-            ret_val = out_collection
-            full_dict['result'] = out
-        elif isinstance(out, SON) and out.get('replace') and out.get('db'):
-            # Must be of the format SON([('replace','results'),('db','outdb')])
-            out_db = getattr(self.database._client, out['db'])
-            out_collection = getattr(out_db, out['replace'])
-            out_collection.insert(reduced_rows)
-            ret_val = out_collection
-            full_dict['result'] = {'db': out['db'], 'collection': out['replace']}
-        elif isinstance(out, dict) and out.get('inline'):
-            ret_val = reduced_rows
-            full_dict['result'] = reduced_rows
-        else:
-            raise TypeError("'out' must be an instance of string, dict or bson.SON")
-        time_millis = (_get_perf_counter() - start_time) * 1000  # pylint: disable=deprecated-method
-        full_dict['timeMillis'] = int(round(time_millis))
-        if full_response:
-            ret_val = full_dict
-        return ret_val
+            ''')
+            doc_list = [json.dumps(doc, default=json_util.default)
+                        for doc in self._find(query)]
+            mapped_rows = map_ctx.call('doMap', map_func, doc_list)
+            reduced_rows = reduce_ctx.call('doReduce', reduce_func, mapped_rows)[:limit]
+            for reduced_row in reduced_rows:
+                if reduced_row['_id'].startswith('$oid'):
+                    reduced_row['_id'] = ObjectId(reduced_row['_id'][4:])
+            reduced_rows = sorted(reduced_rows, key=lambda x: x['_id'])
+            if full_response:
+                full_dict['counts']['input'] = len(doc_list)
+                for key in mapped_rows.keys():
+                    emit_count = len(mapped_rows[key])
+                    full_dict['counts']['emit'] += emit_count
+                    if emit_count > 1:
+                        full_dict['counts']['reduce'] += 1
+                full_dict['counts']['output'] = len(reduced_rows)
+            if isinstance(out, (str, bytes)):
+                out_collection = getattr(self.database, out)
+                out_collection._drop()
+                out_collection.insert(reduced_rows)
+                ret_val = out_collection
+                full_dict['result'] = out
+            elif isinstance(out, SON) and out.get('replace') and out.get('db'):
+                # Must be of the format SON([('replace','results'),('db','outdb')])
+                out_db = getattr(self.database._client, out['db'])
+                out_collection = getattr(out_db, out['replace'])
+                out_collection.insert(reduced_rows)
+                ret_val = out_collection
+                full_dict['result'] = {'db': out['db'], 'collection': out['replace']}
+            elif isinstance(out, dict) and out.get('inline'):
+                ret_val = reduced_rows
+                full_dict['result'] = reduced_rows
+            else:
+                raise TypeError("'out' must be an instance of string, dict or bson.SON")
+            time_millis = (time.perf_counter() - start_time) * 1000
+            full_dict['timeMillis'] = int(round(time_millis))
+            if full_response:
+                ret_val = full_dict
+            return ret_val
 
-    def inline_map_reduce(self, map_func, reduce_func, full_response=False,
-                          query=None, limit=0, session=None):
-        return self._map_reduce(
-            map_func, reduce_func, {'inline': 1}, full_response, query, limit, session=session)
+        def inline_map_reduce(self, map_func, reduce_func, full_response=False,
+                              query=None, limit=0, session=None):
+            return self._map_reduce(
+                map_func, reduce_func, {'inline': 1}, full_response, query, limit, session=session)
 
     def distinct(self, key, filter=None, session=None):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
         return self._find(filter).distinct(key)
 
-    def group(self, key, condition, initial, reduce, finalize=None):
-        if execjs is None:
-            raise NotImplementedError(
-                'PyExecJS is required in order to use group. '
-                "Use 'pip install pyexecjs pymongo' to support group mock."
-            )
-        reduce_ctx = execjs.compile('''
-            function doReduce(fnc, docList) {
-                reducer = eval('('+fnc+')');
-                for(var i=0, l=docList.length; i<l; i++) {
-                    try {
-                        reducedVal = reducer(docList[i-1], docList[i]);
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def group(self, key, condition, initial, reduce, finalize=None):
+            if helpers.PYMONGO_VERSION >= version.parse('3.6'):
+                raise OperationFailure("no such command: 'group'")
+            if execjs is None:
+                raise NotImplementedError(
+                    'PyExecJS is required in order to use group. '
+                    "Use 'pip install pyexecjs pymongo' to support group mock."
+                )
+            reduce_ctx = execjs.compile('''
+                function doReduce(fnc, docList) {
+                    reducer = eval('('+fnc+')');
+                    for(var i=0, l=docList.length; i<l; i++) {
+                        try {
+                            reducedVal = reducer(docList[i-1], docList[i]);
+                        }
+                        catch (err) {
+                            continue;
+                        }
                     }
-                    catch (err) {
-                        continue;
-                    }
+                return docList[docList.length - 1];
                 }
-            return docList[docList.length - 1];
-            }
-        ''')
+            ''')
 
-        ret_array = []
-        doc_list_copy = []
-        ret_array_copy = []
-        reduced_val = {}
-        doc_list = [doc for doc in self._find(condition)]
-        for doc in doc_list:
-            doc_copy = copy.deepcopy(doc)
-            for doc_key in doc:
-                if isinstance(doc[doc_key], ObjectId):
-                    doc_copy[doc_key] = str(doc[doc_key])
-                if doc_key not in key and doc_key not in reduce:
-                    del doc_copy[doc_key]
-            for initial_key in initial:
-                if initial_key in doc.keys():
-                    pass
-                else:
-                    doc_copy[initial_key] = initial[initial_key]
-            doc_list_copy.append(doc_copy)
-        doc_list = doc_list_copy
-        for k1 in key:
-            doc_list = sorted(doc_list, key=lambda x: filtering.resolve_key(k1, x))
-        for k2 in key:
-            if not isinstance(k2, string_types):
-                raise TypeError(
-                    'Keys must be a list of key names, '
-                    'each an instance of %s' % string_types[0].__name__)
-            for _, group in itertools.groupby(doc_list, lambda item: item[k2]):
-                group_list = ([x for x in group])
-                reduced_val = reduce_ctx.call('doReduce', reduce, group_list)
-                ret_array.append(reduced_val)
-        for doc in ret_array:
-            doc_copy = copy.deepcopy(doc)
-            for k in doc:
-                if k not in key and k not in initial.keys():
-                    del doc_copy[k]
-            ret_array_copy.append(doc_copy)
-        ret_array = ret_array_copy
-        return ret_array
+            ret_array = []
+            doc_list_copy = []
+            ret_array_copy = []
+            reduced_val = {}
+            doc_list = [doc for doc in self._find(condition)]
+            for doc in doc_list:
+                doc_copy = copy.deepcopy(doc)
+                for doc_key in doc:
+                    if isinstance(doc[doc_key], ObjectId):
+                        doc_copy[doc_key] = str(doc[doc_key])
+                    if doc_key not in key and doc_key not in reduce:
+                        del doc_copy[doc_key]
+                for initial_key in initial:
+                    if initial_key in doc.keys():
+                        pass
+                    else:
+                        doc_copy[initial_key] = initial[initial_key]
+                doc_list_copy.append(doc_copy)
+            doc_list = doc_list_copy
+            for k1 in key:
+                doc_list = sorted(doc_list, key=lambda x: filtering.resolve_key(k1, x))
+            for k2 in key:
+                if not isinstance(k2, str):
+                    raise TypeError('Keys must be a list of key names, each an instance of str')
+                for _, group in itertools.groupby(doc_list, lambda item: item[k2]):
+                    group_list = ([x for x in group])
+                    reduced_val = reduce_ctx.call('doReduce', reduce, group_list)
+                    ret_array.append(reduced_val)
+            for doc in ret_array:
+                doc_copy = copy.deepcopy(doc)
+                for k in doc:
+                    if k not in key and k not in initial.keys():
+                        del doc_copy[k]
+                ret_array_copy.append(doc_copy)
+            ret_array = ret_array_copy
+            return ret_array
 
     def aggregate(self, pipeline, session=None, **unused_kwargs):
         in_collection = [doc for doc in self._find()]
@@ -1795,7 +1822,7 @@ class Collection(object):
     def with_options(
             self, codec_options=None, read_preference=None, write_concern=None, read_concern=None):
         has_changes = False
-        for key, options in iteritems(_WITH_OPTIONS_KWARGS):
+        for key, options in _WITH_OPTIONS_KWARGS.items():
             value = locals()[key]
             if value is None or value == getattr(self, '_' + key):
                 continue
@@ -1843,7 +1870,7 @@ class Collection(object):
             cursor_type=None, sort=None, allow_partial_results=False,
             oplog_replay=False, modifiers=None, batch_size=0, manipulate=True, collation=None,
             hint=None, max_scan=None, max_time_ms=None, max=None, min=None, return_key=False,
-            how_record_id=False, snapshot=False, comment=None):
+            how_record_id=False, snapshot=False, comment=None, allow_disk_use=False):
         raise NotImplementedError('find_raw_batches method is not implemented in mongomock yet')
 
     def aggregate_raw_batches(self, pipeline, **kwargs):
@@ -1905,7 +1932,7 @@ class Cursor(object):
             self._emitted += 1
             return doc
         except IndexError as err:
-            raise_from(StopIteration(), err)
+            raise StopIteration() from err
 
     next = __next__
 
@@ -1921,12 +1948,13 @@ class Cursor(object):
             self.collection._get_dataset, self._spec, self._sort, self._projection, dict)
         return self
 
-    def count(self, with_limit_and_skip=False):
-        warnings.warn(
-            'count is deprecated. Use Collection.count_documents instead.',
-            DeprecationWarning, stacklevel=2)
-        results = self._compute_results(with_limit_and_skip)
-        return len(results)
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def count(self, with_limit_and_skip=False):
+            warnings.warn(
+                'count is deprecated. Use Collection.count_documents instead.',
+                DeprecationWarning, stacklevel=2)
+            results = self._compute_results(with_limit_and_skip)
+            return len(results)
 
     def skip(self, count):
         self._skip = count
@@ -1953,23 +1981,21 @@ class Cursor(object):
     def distinct(self, key, session=None):
         if session:
             raise_not_implemented('session', 'Mongomock does not handle sessions yet')
-        if not isinstance(key, string_types):
+        if not isinstance(key, str):
             raise TypeError('cursor.distinct key must be a string')
         unique = set()
-        unique_dict_vals = []
         for x in self._compute_results():
-            for value in filtering.iter_key_candidates(key, x):
-                if value == NOTHING:
+            for values in filtering.iter_key_candidates(key, x):
+                if values == NOTHING:
                     continue
-                if isinstance(value, dict):
-                    if any(dict_val == value for dict_val in unique_dict_vals):
-                        continue
-                    unique_dict_vals.append(value)
-                else:
-                    unique.update(
-                        value if isinstance(
-                            value, (tuple, list)) else [value])
-        return list(unique) + unique_dict_vals
+                if not isinstance(values, (tuple, list)):
+                    values = [values]
+                for value in values:
+                    if isinstance(value, dict):
+                        unique.add(helpers.hashdict(value))
+                    else:
+                        unique.add(value)
+        return [dict(v) if isinstance(v, helpers.hashdict) else v for v in unique]
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -2010,7 +2036,7 @@ class Cursor(object):
 
     @property
     def alive(self):
-        return self._emitted != self.count()
+        return self._emitted != len(self._compute_results(with_limit_and_skip=False))
 
     @property
     def collation(self):
@@ -2020,6 +2046,11 @@ class Cursor(object):
         if max_time_ms is not None and not isinstance(max_time_ms, int):
             raise TypeError('max_time_ms must be an integer or None')
         # Currently the value is ignored as mongomock never times out.
+        return self
+
+    def allow_disk_use(self, allow_disk_use=False):
+        if allow_disk_use is not None and not isinstance(allow_disk_use, bool):
+            raise TypeError('allow_disk_use must be a bool')
         return self
 
 

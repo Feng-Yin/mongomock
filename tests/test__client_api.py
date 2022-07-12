@@ -1,4 +1,4 @@
-from distutils import version  # pylint: disable=no-name-in-module
+from packaging import version
 import sys
 import unittest
 from unittest import skipIf, skipUnless
@@ -95,7 +95,7 @@ class MongoClientApiTest(unittest.TestCase):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipUnless(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__not_hashable(self):
         with self.assertRaises(TypeError):
@@ -103,7 +103,7 @@ class MongoClientApiTest(unittest.TestCase):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipIf(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__hashable(self):
         {mongomock.MongoClient('localhost')}  # pylint: disable=expression-not-assigned
@@ -135,13 +135,19 @@ class MongoClientApiTest(unittest.TestCase):
 
     @unittest.skipIf(not _HAVE_MOCK, 'mock not installed')
     def test_database_names(self):
+        client = mongomock.MongoClient()
+        client.one_db.my_collec.insert_one({})
+
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            with self.assertRaises(TypeError):
+                client.database_names()
+            return
+
         with mock.patch('warnings.warn') as mock_warn:
-            client = mongomock.MongoClient()
-            client.one_db.my_collec.insert_one({})
-            mock_warn.assert_not_called()
             self.assertEqual(['one_db'], client.database_names())
-            self.assertEqual(1, mock_warn.call_count)
-            self.assertIn('deprecated', mock_warn.call_args[0][0])
+
+        self.assertEqual(1, mock_warn.call_count)
+        self.assertIn('deprecated', mock_warn.call_args[0][0])
 
     def test_list_database_names(self):
         client = mongomock.MongoClient()
@@ -164,3 +170,16 @@ class MongoClientApiTest(unittest.TestCase):
         client = mongomock.MongoClient()
         with self.assertRaises(NotImplementedError):
             client.start_session()
+
+    @mock.patch('mongomock.SERVER_VERSION', '3.6')
+    def test_server_version(self):
+        client = mongomock.MongoClient()
+        server_info = client.server_info()
+        self.assertEqual('3.6', server_info['version'])
+        self.assertEqual([3, 6, 0, 0], server_info['versionArray'])
+
+    def test_consistent_server_version(self):
+        client = mongomock.MongoClient()
+        server_info = client.server_info()
+        with mock.patch('mongomock.SERVER_VERSION', '3.6'):
+            self.assertEqual(server_info, client.server_info())

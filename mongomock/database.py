@@ -1,4 +1,4 @@
-from distutils import version  # pylint: disable=no-name-in-module
+from packaging import version
 import warnings
 
 from . import CollectionInvalid
@@ -10,8 +10,6 @@ from mongomock import codec_options as mongomock_codec_options
 from mongomock import helpers
 from mongomock import read_preferences
 from mongomock import store
-
-from six import string_types, PY3
 
 try:
     from pymongo import ReadPreference
@@ -68,9 +66,7 @@ class Database(object):
             return self._client == other._client and self.name == other.name
         return NotImplemented
 
-    if PY3 and (
-        not helpers.PYMONGO_VERSION or helpers.PYMONGO_VERSION >= version.LooseVersion('3.12')
-    ):
+    if helpers.PYMONGO_VERSION >= version.parse('3.12'):
         def __hash__(self):
             return hash((self._client, self.name))
 
@@ -93,12 +89,17 @@ class Database(object):
     def _get_created_collections(self):
         return self._store.list_created_collection_names()
 
-    def collection_names(self, include_system_collections=True, session=None):
-        warnings.warn('collection_names is deprecated. Use list_collection_names instead.')
-        if include_system_collections:
-            return list(self._get_created_collections())
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def collection_names(self, include_system_collections=True, session=None):
+            warnings.warn('collection_names is deprecated. Use list_collection_names instead.')
+            if include_system_collections:
+                return list(self._get_created_collections())
+            return self.list_collection_names(session=session)
 
-        return self.list_collection_names(session=session)
+    def list_collections(self, filter=None, session=None, nameOnly=False):
+        raise NotImplementedError(
+            'list_collections is a valid method of Database but has not been implemented in '
+            'mongomock yet.')
 
     def list_collection_names(self, filter=None, session=None):
         """filter: only name field type with eq,ne or regex operator
@@ -159,8 +160,8 @@ class Database(object):
 
     def _ensure_valid_collection_name(self, name):
         # These are the same checks that are done in pymongo.
-        if not isinstance(name, string_types):
-            raise TypeError('name must be an instance of basestring')
+        if not isinstance(name, str):
+            raise TypeError('name must be an instance of str')
         if not name or '..' in name:
             raise InvalidName('collection names cannot be empty')
         if name[0] == '.' or name[-1] == '.':
@@ -213,7 +214,7 @@ class Database(object):
         return self[dbref.collection].find_one({'_id': dbref.id})
 
     def command(self, command, **unused_kwargs):
-        if isinstance(command, string_types):
+        if isinstance(command, str):
             command = {command: 1}
         if 'ping' in command:
             return {'ok': 1.}

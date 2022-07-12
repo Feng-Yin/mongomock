@@ -1,6 +1,8 @@
 import os
 
 import mongomock
+from mongomock import helpers
+from packaging import version
 
 try:
     from unittest import mock
@@ -14,15 +16,15 @@ except ImportError:
 
 try:
     import pymongo
-    _HAVE_PYMONGO = True
 except ImportError:
-    _HAVE_PYMONGO = False
-
+    pymongo = None
 
 from tests.multicollection import MultiCollection
 from unittest import TestCase, skipIf
 
 
+# https://pymongo.readthedocs.io/en/stable/migrate-to-pymongo4.html#collection-initialize-ordered-bulk-op-and-initialize-unordered-bulk-op-is-removed
+@skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above')
 class BulkOperationsTest(TestCase):
 
     test_with_pymongo = False
@@ -96,9 +98,9 @@ class BulkOperationsTest(TestCase):
         self.__check_number_of_elements(0)
 
     def test__update_must_update_all_documents(self):
-        self.db.collection.insert({'a': 1, 'b': 2})
-        self.db.collection.insert({'a': 2, 'b': 4})
-        self.db.collection.insert({'a': 2, 'b': 8})
+        self.db.collection.insert_one({'a': 1, 'b': 2})
+        self.db.collection.insert_one({'a': 2, 'b': 4})
+        self.db.collection.insert_one({'a': 2, 'b': 8})
 
         self.bulk_op.find({'a': 1}).update({'$set': {'b': 20}})
         self.bulk_op.find({'a': 2}).update({'$set': {'b': 40}})
@@ -118,8 +120,8 @@ class BulkOperationsTest(TestCase):
         self.__check_document({'a': 1, 'b': 3})
 
     def test__update_one(self):
-        self.db.collection.insert({'a': 2, 'b': 1})
-        self.db.collection.insert({'a': 2, 'b': 2})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 2})
 
         self.bulk_op.find({'a': 2}).update_one({'$set': {'b': 3}})
         self.__execute_and_check_result(nMatched=1, nModified=1)
@@ -127,8 +129,8 @@ class BulkOperationsTest(TestCase):
         self.__check_number_of_elements(2)
 
     def test__remove(self):
-        self.db.collection.insert({'a': 2, 'b': 1})
-        self.db.collection.insert({'a': 2, 'b': 2})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 2})
 
         self.bulk_op.find({'a': 2}).remove()
 
@@ -136,8 +138,8 @@ class BulkOperationsTest(TestCase):
         self.__check_number_of_elements(0)
 
     def test__remove_one(self):
-        self.db.collection.insert({'a': 2, 'b': 1})
-        self.db.collection.insert({'a': 2, 'b': 2})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 2})
 
         self.bulk_op.find({'a': 2}).remove_one()
 
@@ -151,8 +153,8 @@ class BulkOperationsTest(TestCase):
         self.__execute_and_check_result(nUpserted=1, upserted=[{'index': 0, '_id': mock.ANY}])
 
     def test_upsert_replace_one(self):
-        self.db.collection.insert({'a': 2, 'b': 1})
-        self.db.collection.insert({'a': 2, 'b': 2})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 2})
         self.bulk_op.find({'a': 2}).replace_one({'x': 1})
         self.__execute_and_check_result(nModified=1, nMatched=1)
         self.__check_document({'a': 2}, 1)
@@ -167,16 +169,16 @@ class BulkOperationsTest(TestCase):
         self.__check_number_of_elements(1)
 
     def test_upsert_update(self):
-        self.db.collection.insert({'a': 2, 'b': 1})
-        self.db.collection.insert({'a': 2, 'b': 2})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 2})
         self.bulk_op.find({'a': 2}).upsert().update({'$set': {'b': 3}})
         self.__execute_and_check_result(nMatched=2, nModified=2)
         self.__check_document({'a': 2, 'b': 3}, 2)
         self.__check_number_of_elements(2)
 
     def test_upsert_update_one(self):
-        self.db.collection.insert({'a': 2, 'b': 1})
-        self.db.collection.insert({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
+        self.db.collection.insert_one({'a': 2, 'b': 1})
         self.bulk_op.find({'a': 2}).upsert().update_one({'$inc': {'b': 1, 'x': 1}})
         self.__execute_and_check_result(nModified=1, nMatched=1)
         self.__check_document({'a': 2, 'b': 1}, 1)
@@ -184,14 +186,16 @@ class BulkOperationsTest(TestCase):
         self.__check_number_of_elements(2)
 
 
-@skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+@skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
 @skipIf(os.getenv('NO_LOCAL_MONGO'), 'No local Mongo server running')
 class BulkOperationsWithPymongoTest(BulkOperationsTest):
     test_with_pymongo = True
 
 
-@skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+@skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
 @skipIf(os.getenv('NO_LOCAL_MONGO'), 'No local Mongo server running')
+# https://pymongo.readthedocs.io/en/stable/migrate-to-pymongo4.html#collection-initialize-ordered-bulk-op-and-initialize-unordered-bulk-op-is-removed
+@skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above')
 class CollectionComparisonTest(TestCase):
 
     def setUp(self):

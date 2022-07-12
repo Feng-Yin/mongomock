@@ -1,6 +1,6 @@
 import collections
 import datetime
-from distutils import version  # pylint: disable=no-name-in-module
+from packaging import version
 import sys
 from unittest import TestCase, skipIf, skipUnless
 
@@ -161,19 +161,19 @@ class DatabaseAPITest(TestCase):
             self.database.with_options(custom_tzinfo)
 
     @skipIf(
-        not helpers.PYMONGO_VERSION or helpers.PYMONGO_VERSION < version.LooseVersion('3.8'),
+        not helpers.HAVE_PYMONGO or helpers.PYMONGO_VERSION < version.parse('3.8'),
         'pymongo not installed or <3.8')
     def test__with_options_type_registry(self):
         class _CustomTypeCodec(codec_options.TypeCodec):
             @property
-            def python_type(self):
+            def python_type(self):  # pylint: disable=invalid-overridden-method
                 return _CustomTypeCodec
 
             def transform_python(self, unused_value):
                 pass
 
             @property
-            def bson_type(self):
+            def bson_type(self):  # pylint: disable=invalid-overridden-method
                 return int
 
             def transform_bson(self, unused_value):
@@ -187,6 +187,12 @@ class DatabaseAPITest(TestCase):
     def test__collection_names(self):
         self.database.create_collection('a')
         self.database.create_collection('b')
+
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            with self.assertRaises(TypeError):
+                self.database.collection_names()
+            return
+
         self.assertEqual(set(self.database.collection_names()), set(['a', 'b']))
 
         self.database.c.drop()
@@ -199,6 +205,12 @@ class DatabaseAPITest(TestCase):
 
         self.database.c.drop()
         self.assertEqual(set(self.database.list_collection_names()), set(['a', 'b']))
+
+    def test__list_collections(self):
+        self.database.create_collection('a')
+
+        with self.assertRaises(NotImplementedError):
+            self.database.list_collections()
 
     def test__create_collection(self):
         coll = self.database.create_collection('c')
@@ -230,7 +242,7 @@ class DatabaseAPITest(TestCase):
     def test__lazy_create_collection(self):
         col = self.database.a
         self.assertEqual(set(self.database.list_collection_names()), set())
-        col.insert({'foo': 'bar'})
+        col.insert_one({'foo': 'bar'})
         self.assertEqual(set(self.database.list_collection_names()), set(['a']))
 
     def test__equality(self):
@@ -243,7 +255,7 @@ class DatabaseAPITest(TestCase):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipUnless(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__not_hashable(self):
         with self.assertRaises(TypeError):
@@ -251,7 +263,7 @@ class DatabaseAPITest(TestCase):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipIf(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__hashable(self):
         {self.database}  # pylint: disable=pointless-statement

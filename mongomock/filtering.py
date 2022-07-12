@@ -9,7 +9,6 @@ import numbers
 import operator
 import re
 from sentinels import NOTHING
-from six import iteritems, string_types, PY3
 try:
     from types import NoneType
 except ImportError:
@@ -21,6 +20,11 @@ try:
 except ImportError:
     DBRef = None
     _RE_TYPES = (RE_TYPE,)
+
+try:
+    from bson.decimal128 import Decimal128
+except ImportError:
+    Decimal128 = None
 
 _TOP_LEVEL_OPERATORS = {'$expr', '$text', '$where', '$jsonSchema'}
 
@@ -68,14 +72,14 @@ class _Filterer(object):
             '$type': _type_op
         }, **{
             key: _not_nothing_and(_list_expand(_compare_objects(op)))
-            for key, op in iteritems(SORTING_OPERATOR_MAP)
+            for key, op in SORTING_OPERATOR_MAP.items()
         })
 
     def apply(self, search_filter, document):
         if not isinstance(search_filter, dict):
             raise OperationFailure('the match filter must be an expression in an object')
 
-        for key, search in iteritems(search_filter):
+        for key, search in search_filter.items():
             # Top level operators.
             if key == '$comment':
                 continue
@@ -134,9 +138,9 @@ class _Filterer(object):
                         and self._operator_map[operator_string](doc_val, search_val)
                         or operator_string == '$not'
                         and self._not_op(document, key, search_val)
-                        for operator_string, search_val in iteritems(search)
+                        for operator_string, search_val in search.items()
                     ) and search
-                elif isinstance(search, _RE_TYPES) and isinstance(doc_val, (string_types, list)):
+                elif isinstance(search, _RE_TYPES) and isinstance(doc_val, (str, list)):
                     is_match = _regex(doc_val, search)
                 elif key in LOGICAL_OPERATOR_MAP:
                     if not search:
@@ -205,11 +209,11 @@ def iter_key_candidates(key, doc):
 
     Returns the appropriate nested value if the key includes dot notation.
     """
-    if doc is None:
-        return ()
-
     if not key:
         return [doc]
+
+    if doc is None:
+        return ()
 
     if isinstance(doc, list):
         return _iter_key_candidates_sublist(key, doc)
@@ -242,10 +246,14 @@ def _iter_key_candidates_sublist(key, doc):
 
     if sub_key_int is None:
         # subkey is not an integer...
-        return [x
-                for sub_doc in doc
-                if isinstance(sub_doc, dict) and sub_key in sub_doc
-                for x in iter_key_candidates(key_remainder, sub_doc[sub_key])]
+        ret = []
+        for sub_doc in doc:
+            if isinstance(sub_doc, dict):
+                if sub_key in sub_doc:
+                    ret.extend(iter_key_candidates(key_remainder, sub_doc[sub_key]))
+                else:
+                    ret.append(NOTHING)
+        return ret
 
     # subkey is an index
     if sub_key_int >= len(doc):
@@ -319,8 +327,8 @@ def bson_compare(op, a, b, can_compare_types=True):
         # MongoDb server compares the type before comparing the keys
         # https://github.com/mongodb/mongo/blob/f10f214/src/mongo/bson/bsonelement.cpp#L516
         # even though the documentation does not say anything about that.
-        a = [(_get_compare_type(v), k, v) for k, v in iteritems(a)]
-        b = [(_get_compare_type(v), k, v) for k, v in iteritems(b)]
+        a = [(_get_compare_type(v), k, v) for k, v in a.items()]
+        b = [(_get_compare_type(v), k, v) for k, v in b.items()]
 
     if isinstance(a, (tuple, list)):
         for item_a, item_b in zip(a, b):
@@ -333,7 +341,7 @@ def bson_compare(op, a, b, can_compare_types=True):
 
     # bson handles bytes as binary in python3+:
     # https://api.mongodb.com/python/current/api/bson/index.html
-    if PY3 and isinstance(a, bytes):
+    if isinstance(a, bytes):
         # Performs the same operation as described by:
         # https://docs.mongodb.com/manual/reference/bson-type-comparison-order/#bindata
         if len(a) != len(b):
@@ -355,7 +363,7 @@ def _get_compare_type(val):
         return 40
     if isinstance(val, numbers.Number):
         return 10
-    if isinstance(val, string_types):
+    if isinstance(val, str):
         return 15
     if isinstance(val, dict):
         return 20
@@ -364,7 +372,6 @@ def _get_compare_type(val):
     if isinstance(val, uuid.UUID):
         return 30
     if isinstance(val, bytes):
-        assert PY3
         return 30
     if isinstance(val, ObjectId):
         return 35
@@ -382,16 +389,16 @@ def _get_compare_type(val):
 
 
 def _regex(doc_val, regex):
-    if not (isinstance(doc_val, (string_types, list)) or isinstance(doc_val, RE_TYPE)):
+    if not (isinstance(doc_val, (str, list)) or isinstance(doc_val, RE_TYPE)):
         return False
-    if isinstance(regex, string_types):
+    if isinstance(regex, str):
         regex = re.compile(regex)
     if not isinstance(regex, RE_TYPE):
         # bson.Regex
         regex = regex.try_compile()
     return any(
         regex.search(item) for item in _force_list(doc_val)
-        if isinstance(item, string_types))
+        if isinstance(item, str))
 
 
 def _size_op(doc_val, search_val):
@@ -410,16 +417,20 @@ def _list_expand(f, negative=False):
     return func
 
 
-def _type_op(doc_val, search_val):
+def _type_op(doc_val, search_val, in_array=False):
     if search_val not in TYPE_MAP:
         raise OperationFailure('%r is not a valid $type' % search_val)
     elif TYPE_MAP[search_val] is None:
         raise NotImplementedError('%s is a valid $type but not implemented' % search_val)
-    return isinstance(doc_val, TYPE_MAP[search_val])
+    if TYPE_MAP[search_val](doc_val):
+        return True
+    if isinstance(doc_val, (list, tuple)) and not in_array:
+        return any(_type_op(val, search_val, in_array=True) for val in doc_val)
+    return False
 
 
 def _combine_regex_options(search):
-    if not isinstance(search['$options'], string_types):
+    if not isinstance(search['$options'], str):
         raise OperationFailure('$options has to be a string')
 
     options = None
@@ -469,29 +480,39 @@ LOGICAL_OPERATOR_MAP = {
     '$or': lambda d, subq, filter_func: any(filter_func(q, d) for q in subq),
     '$and': lambda d, subq, filter_func: all(filter_func(q, d) for q in subq),
     '$nor': lambda d, subq, filter_func: all(not filter_func(q, d) for q in subq),
+    '$not': lambda d, subq, filter_func: (not filter_func(q, d) for q in subq),
 }
 
 
 TYPE_MAP = {
-    'double': (float,),
-    'string': (str,),
-    'object': (dict,),
-    'array': (list,),
-    'binData': (bytes,),
+    'double': lambda v: isinstance(v, float),
+    'string': lambda v: isinstance(v, str),
+    'object': lambda v: isinstance(v, dict),
+    'array': lambda v: isinstance(v, list),
+    'binData': lambda v: isinstance(v, bytes),
     'undefined': None,
-    'objectId': (ObjectId,),
-    'bool': (bool,),
-    'date': (datetime,),
+    'objectId': lambda v: isinstance(v, ObjectId),
+    'bool': lambda v: isinstance(v, bool),
+    'date': lambda v: isinstance(v, datetime),
     'null': None,
     'regex': None,
     'dbPointer': None,
     'javascript': None,
     'symbol': None,
     'javascriptWithScope': None,
-    'int': (int,),
+    'int': lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v.bit_length() <= 32
+    ),
     'timestamp': None,
-    'long': (float,),
-    'decimal': (float,),
+    'long': lambda v: (
+        isinstance(v, int) and not isinstance(v, bool) and v.bit_length() > 32
+    ),
+    'decimal': (lambda v: isinstance(v, Decimal128)) if Decimal128 else None,
+    'number': lambda v: (
+        # pylint: disable-next=isinstance-second-argument-not-valid-type
+        isinstance(v, (int, float) + ((Decimal128,) if Decimal128 else ()))
+        and not isinstance(v, bool)
+    ),
     'minKey': None,
     'maxKey': None,
 }

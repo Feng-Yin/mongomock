@@ -2,10 +2,9 @@
 from collections import OrderedDict
 import copy
 import datetime
-from distutils import version  # pylint: disable=no-name-in-module
 import os
+from packaging import version
 import re
-from six import assertCountEqual
 import sys
 import time
 from unittest import TestCase, skipIf, skipUnless
@@ -35,7 +34,11 @@ try:
     _HAVE_MAP_REDUCE = any(r.is_available() for r in execjs.runtimes().values())
 except ImportError:
     _HAVE_MAP_REDUCE = False
+    Code = str
 from tests.multicollection import MultiCollection
+
+
+SERVER_VERSION = version.parse(mongomock.SERVER_VERSION)
 
 
 class InterfaceTest(TestCase):
@@ -105,30 +108,35 @@ class DatabaseGettingTest(TestCase):
         db = self.client.a
         collection = db.a
         doc_id = collection.insert_one({'aa': 'bb'}).inserted_id
-        result = collection.find({'_id': doc_id})
-        self.assertEqual(result.count(), 1)
+        self.assertEqual(collection.count_documents({'_id': doc_id}), 1)
 
         self.client.drop_database('a')
-        result = collection.find({'_id': doc_id})
-        self.assertEqual(result.count(), 0)
+        self.assertEqual(collection.count_documents({'_id': doc_id}), 0)
 
         db = self.client.a
         collection = db.a
 
         doc_id = collection.insert_one({'aa': 'bb'}).inserted_id
-        result = collection.find({'_id': doc_id})
-        self.assertEqual(result.count(), 1)
+        self.assertEqual(collection.count_documents({'_id': doc_id}), 1)
 
         self.client.drop_database(db)
-        result = collection.find({'_id': doc_id})
-        self.assertEqual(result.count(), 0)
+        self.assertEqual(collection.count_documents({'_id': doc_id}), 0)
+
+    def test__drop_database_system_collection(self):
+        db = self.client.a
+        collection = db['system.foo']
+        doc_id = collection.insert_one({'aa': 'bb'}).inserted_id
+        self.assertEqual(collection.count_documents({'_id': doc_id}), 1)
+
+        self.client.drop_database('a')
+        self.assertEqual(collection.count_documents({'_id': doc_id}), 0)
 
     def test__drop_database_indexes(self):
         db = self.client.somedb
         collection = db.a
         collection.create_index('simple')
         collection.create_index([('value', 1)], unique=True)
-        collection.ensure_index([('sparsed', 1)], unique=True, sparse=True)
+        collection.create_index([('sparsed', 1)], unique=True, sparse=True)
 
         self.client.drop_database('somedb')
 
@@ -136,8 +144,7 @@ class DatabaseGettingTest(TestCase):
         collection.insert_one({'value': 'not_unique_but_ok', 'sparsed': 'not_unique_but_ok'})
         collection.insert_one({'value': 'not_unique_but_ok'})
         collection.insert_one({'sparsed': 'not_unique_but_ok'})
-        result = collection.find({})
-        self.assertEqual(result.count(), 3)
+        self.assertEqual(collection.count_documents({}), 3)
 
     def test__sparse_unique_index(self):
         db = self.client.somedb
@@ -148,7 +155,7 @@ class DatabaseGettingTest(TestCase):
         collection.insert_one({'simple': 'simple_without_value'})
         collection.insert_one({'simple': 'simple_without_value2'})
 
-        collection.ensure_index([('value', 1)], unique=True, sparse=True)
+        collection.create_index([('value', 1)], unique=True, sparse=True)
 
     def test__alive(self):
         self.assertTrue(self.client.alive())
@@ -307,7 +314,7 @@ class EqualityCollectionTest(_CollectionComparisonTest):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipIf(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__database_hashable(self):
         {self.mongo_conn[self.db_name]}  # pylint: disable=pointless-statement
@@ -315,7 +322,7 @@ class EqualityCollectionTest(_CollectionComparisonTest):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipUnless(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__database_not_hashable(self):
         with self.assertRaises(TypeError):
@@ -347,6 +354,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare_ignore_order.find()
 
     def test__insert(self):
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.insert({'a': 1})
+            return
         self.cmp.do.insert({'a': 1})
         self.cmp.compare.find()
 
@@ -361,6 +371,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
     def test__save(self):
         # add an item with a non ObjectId _id first.
         self.cmp.do.insert_one({'_id': 'b'})
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.save({'_id': ObjectId(), 'someProp': 1})
+            return
         self.cmp.do.save({'_id': ObjectId(), 'someProp': 1})
         self.cmp.compare_ignore_order.find()
 
@@ -395,6 +408,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
             self.cmp.do.delete_one({'_id': doc_id})
 
     def test__count(self):
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.count()
+            return
         self.cmp.compare.count()
         self.cmp.do.insert_one({'a': 1})
         self.cmp.compare.count()
@@ -403,7 +419,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare.count({'a': 1})
 
     @skipIf(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.8'),
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.parse('3.8'),
         'older version of pymongo does not have count_documents')
     def test__count_documents(self):
         self.cmp.compare.count_documents({})
@@ -420,7 +436,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare_exceptions.count_documents({}, limit='1')
 
     @skipIf(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.8'),
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.parse('3.8'),
         'older version of pymongo does not have estimated_document_count')
     def test__estimated_document_count(self):
         self.cmp.compare.estimated_document_count()
@@ -428,9 +444,19 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare.estimated_document_count()
         self.cmp.do.insert_one({'a': 0})
         self.cmp.compare.estimated_document_count()
-        # skip is not supported
-        # self.cmp.compare.estimated_document_count(skip=2)
+        if SERVER_VERSION < version.parse('5'):
+            self.cmp.compare.estimated_document_count(skip=2)
+        else:
+            self.cmp.compare_exceptions.estimated_document_count(skip=2)
         self.cmp.compare_exceptions.estimated_document_count(filter={'a': 1})
+
+    def test__reindex(self):
+        self.cmp.compare.create_index('a')
+        self.cmp.do.insert_one({'a': 1})
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.reindex()
+            return
+        self.cmp.do.reindex()
 
     def test__find_one(self):
         self.cmp.do.insert_one({'_id': 'id1', 'name': 'new'})
@@ -524,6 +550,14 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
 
         self.cmp.do.insert_one({'_id': 4})
         self.cmp.compare_exceptions.find({'$expr': {'$eq': [{'$size': ['$a']}, 1]}})
+
+    def test_double_negation(self):
+        self.cmp.do.insert_many([
+            {'_id': 1, 'a': 'some str'},
+            {'_id': 2, 'a': 'another str'},
+            {'_id': 3, 'a': []},
+        ])
+        self.cmp.compare.find({'a': {'$not': {'$not': {'$regex': '^some'}}}})
 
     def test__size(self):
         id = ObjectId()
@@ -727,6 +761,20 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare.find(
             {'field.0.a': {'$exists': True}, 'field.1.a': {'$exists': False}})
 
+    def test__find_in_array_equal_null(self):
+        self.cmp.do.insert_many([
+            {'_id': 1, 'shape': [{'color': 'red'}]},
+            {'_id': 2, 'shape': [{'color': 'yellow'}]},
+            {'_id': 3, 'shape': [{'color': 'red'}, {'color': 'yellow'}]},
+            {'_id': 4, 'shape': [{'size': 3}]},
+            {'_id': 5},
+            {'_id': 6, 'shape': {'color': ['red', 'yellow']}},
+            {'_id': 7, 'shape': [{'color': 'red'}, {'color': None}]},
+        ])
+
+        self.cmp.compare_ignore_order.find({'shape.color': {'$eq': None}})
+        self.cmp.compare_ignore_order.find({'shape.color': None})
+
     def test__find_notequal(self):
         """Test searching with operators other than equality."""
         bob = {'_id': 1, 'name': 'bob'}
@@ -764,21 +812,22 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare_ignore_order.find({'name': {'$not': Regex('dan')}})
 
     def test__find_not_exceptions(self):
+        # pylint: disable=expression-not-assigned
         self.cmp.do.insert_one(dict(noise='longhorn'))
         with self.assertRaises(OperationFailure):
-            self.mongo_collection.find({'name': {'$not': True}}).count()
+            self.mongo_collection.find({'name': {'$not': True}})[0]
         with self.assertRaises(OperationFailure):
-            self.fake_collection.find({'name': {'$not': True}}).count()
+            self.fake_collection.find({'name': {'$not': True}})[0]
 
         with self.assertRaises(OperationFailure):
-            self.mongo_collection.find({'name': {'$not': []}}).count()
+            self.mongo_collection.find({'name': {'$not': []}})[0]
         with self.assertRaises(OperationFailure):
-            self.fake_collection.find({'name': {'$not': []}}).count()
+            self.fake_collection.find({'name': {'$not': []}})[0]
 
         with self.assertRaises(OperationFailure):
-            self.mongo_collection.find({'name': {'$not': ''}}).count()
+            self.mongo_collection.find({'name': {'$not': ''}})[0]
         with self.assertRaises(OperationFailure):
-            self.fake_collection.find({'name': {'$not': ''}}).count()
+            self.fake_collection.find({'name': {'$not': ''}})[0]
 
     def test__find_compare(self):
         self.cmp.do.insert_one(dict(noise='longhorn', sqrd='non numeric'))
@@ -899,6 +948,10 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
 
     def test__find_and_modify_remove(self):
         self.cmp.do.insert_many([{'a': x, 'junk': True} for x in range(10)])
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.find_and_modify(
+                {'a': 2}, remove=True, fields={'_id': False, 'a': True})
+            return
         self.cmp.compare.find_and_modify({'a': 2}, remove=True, fields={'_id': False, 'a': True})
         self.cmp.compare_ignore_order.find()
 
@@ -997,7 +1050,41 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         # self.cmp.compare.find_one(
         #     {'a': 1}, OrderedDict([('_id', 0), ('a', 0), ('b.c.e', 0), ('b.c', 0)]))
 
+    def test__find_type(self):
+        supported_types = (
+            'double',
+            'string',
+            'object',
+            'array',
+            'binData',
+            'objectId',
+            'bool',
+            'date',
+            'int',
+            'long',
+            'decimal',
+            'number',
+        )
+        self.cmp.do.insert_many([
+            {'a': 1.2},  # double
+            {'a': 'a string value'},  # string
+            {'a': {'b': 1}},  # object
+            {'a': [1, 2, 3]},  # array or int
+            {'a': b'hello'},  # binData
+            {'a': ObjectId()},  # objectId
+            {'a': True},  # bool
+            {'a': datetime.datetime.now()},  # date
+            {'a': 1},  # int
+            {'a': 1 << 32},  # long
+            {'a': decimal128.Decimal128('1.1')},  # decimal
+        ])
+        for type_name in supported_types:
+            self.cmp.compare.find({'a': {'$type': type_name}})
+
     @skipIf(sys.version_info < (3, 7), 'Older versions of Python cannot copy regex partterns')
+    @skipIf(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'pymongo v4 or above do not specify uuid encoding')
     def test__sort_mixed_types(self):
         self.cmp.do.insert_many([
             {'type': 'bool', 'a': True},
@@ -1018,6 +1105,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         ])
         self.cmp.compare.find({}, sort=[('a', 1), ('type', 1)])
 
+    @skipIf(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'pymongo v4 or above do not specify uuid encoding')
     def test__find_sort_uuid(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_many([
@@ -1026,6 +1116,12 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
             {'_id': uuid.UUID(int=2), 'timestamp': 100, 'a': 2},
         ])
         self.cmp.compare.find({}, sort=[('timestamp', 1), ('_id', 1)])
+
+    @skipIf(
+        helpers.PYMONGO_VERSION < version.parse('4.0'),
+        'old version of pymongo accepts to encode uuid')
+    def test__fail_at_uuid_encoding(self):
+        self.cmp.compare_exceptions.insert_one({'_id': uuid.UUID(int=2)})
 
     def test__find_all(self):
         self.cmp.do.insert_many([
@@ -1117,7 +1213,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare_ignore_order.find(
             {'name': 'Chucky'}, projection={'properties.type': 0, 'properties.model': 0})
 
-    def test__default_fields_to_id_if_empty(self):
+    def test__default_fields_if_projection_empty(self):
         self.cmp.do.insert_one({'name': 'Chucky', 'type': 'doll', 'model': 'v6'})
         self.cmp.compare_ignore_order.find({'name': 'Chucky'}, projection=[])
 
@@ -1179,6 +1275,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         """Test the remove method."""
         self.cmp.do.insert_one({'value': 1})
         self.cmp.compare_ignore_order.find()
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.remove()
+            return
         self.cmp.do.remove()
         self.cmp.compare.find()
         self.cmp.do.insert_many([
@@ -1211,9 +1310,13 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         doc = {'a': 1}
         self.cmp.do.insert_one(doc)
         new_document = {'new_attr': 2}
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.update({'a': 1}, new_document)
+            return
         self.cmp.do.update({'a': 1}, new_document)
         self.cmp.compare_ignore_order.find()
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above dropped update')
     def test__update_upsert_with_id(self):
         self.cmp.do.update(
             {'a': 1}, {'_id': ObjectId('52d669dcad547f059424f783'), 'a': 1}, upsert=True)
@@ -1225,7 +1328,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare.find()
 
     def test__update_upsert_with_dots(self):
-        self.cmp.do.update(
+        self.cmp.do.update_one(
             {'a.b': 1}, {'$set': {'c': 2}}, upsert=True)
         self.cmp.compare.find()
 
@@ -1243,8 +1346,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
             {'$set': {'a': 1}}, upsert=True)
         self.cmp.compare.find()
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above dropped update')
     def test__update_with_empty_document_comes(self):
-        """Tests calling update with just '{}' for replacing whole document"""
+        """Tests calling update_one with just '{}' for replacing whole document"""
         self.cmp.do.insert_one({'name': 'bob', 'hat': 'wide'})
         self.cmp.do.update({'name': 'bob'}, {})
         self.cmp.compare.find()
@@ -1264,10 +1368,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
                                upsert=True)
         self.cmp.compare.find()
 
-        # no idea why it failed....
-        # self.cmp.compare_exceptions.update_one({}, {'$set': {}})
-        # self.cmp.compare_exceptions.update_one({'a': 'does-not-exist'}, {'$set': {}})
-        # self.cmp.compare_exceptions.update_one({'a': 'does-not-exist'}, {'$set': {}}, upsert=True)
+        self.cmp.compare_exceptions.update_one({}, {'$set': {}})
+        self.cmp.compare_exceptions.update_one({'a': 'does-not-exist'}, {'$set': {}})
+        self.cmp.compare_exceptions.update_one({'a': 'does-not-exist'}, {'$set': {}}, upsert=True)
 
     def test__update_many(self):
         self.cmp.do.insert_many([{'a': 1, 'b': 0},
@@ -1296,63 +1399,64 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
 
     def test__set(self):
         """Tests calling update with $set members."""
-        self.cmp.do.update({'_id': 42},
-                           {'$set': {'some': 'thing'}},
-                           upsert=True)
+        self.cmp.do.update_one(
+            {'_id': 42},
+            {'$set': {'some': 'thing'}},
+            upsert=True)
         self.cmp.compare.find({'_id': 42})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$set': {'hat': 'green'}})
+        self.cmp.do.update_one({'name': 'bob'}, {'$set': {'hat': 'green'}})
         self.cmp.compare.find({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$set': {'hat': 'red'}})
+        self.cmp.do.update_one({'name': 'bob'}, {'$set': {'hat': 'red'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__unset(self):
         """Tests calling update with $unset members."""
-        self.cmp.do.update({'name': 'bob'}, {'a': 'aaa'}, upsert=True)
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'a': 'aaa'}}, upsert=True)
         self.cmp.compare.find({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$unset': {'a': 0}})
-        self.cmp.compare.find({'name': 'bob'})
-
-        self.cmp.do.update({'name': 'bob'}, {'a': 'aaa'}, upsert=True)
-        self.cmp.compare.find({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$unset': {'a': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$unset': {'a': 0}})
         self.cmp.compare.find({'name': 'bob'})
 
-        self.cmp.do.update({'name': 'bob'}, {'a': 'aaa'}, upsert=True)
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'a': 'aaa'}}, upsert=True)
         self.cmp.compare.find({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$unset': {'a': ''}})
-        self.cmp.compare.find({'name': 'bob'})
-
-        self.cmp.do.update({'name': 'bob'}, {'a': 'aaa'}, upsert=True)
-        self.cmp.compare.find({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$unset': {'a': True}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$unset': {'a': 1}})
         self.cmp.compare.find({'name': 'bob'})
 
-        self.cmp.do.update({'name': 'bob'}, {'a': 'aaa'}, upsert=True)
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'a': 'aaa'}}, upsert=True)
         self.cmp.compare.find({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$unset': {'a': False}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$unset': {'a': ''}})
+        self.cmp.compare.find({'name': 'bob'})
+
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'a': 'aaa'}}, upsert=True)
+        self.cmp.compare.find({'name': 'bob'})
+        self.cmp.do.update_many({'name': 'bob'}, {'$unset': {'a': True}})
+        self.cmp.compare.find({'name': 'bob'})
+
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'a': 'aaa'}}, upsert=True)
+        self.cmp.compare.find({'name': 'bob'})
+        self.cmp.do.update_many({'name': 'bob'}, {'$unset': {'a': False}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__unset_nested(self):
-        self.cmp.do.update({'_id': 1}, {'$set': {'a': {'b': 1, 'c': 2}}}, upsert=True)
-        self.cmp.do.update({'_id': 1}, {'$unset': {'a.b': True}})
+        self.cmp.do.update_many({'_id': 1}, {'$set': {'a': {'b': 1, 'c': 2}}}, upsert=True)
+        self.cmp.do.update_many({'_id': 1}, {'$unset': {'a.b': True}})
         self.cmp.compare.find()
 
-        self.cmp.do.update({'_id': 1}, {'$set': {'a': {'b': 1, 'c': 2}}}, upsert=True)
-        self.cmp.do.update({'_id': 1}, {'$unset': {'a.b': False}})
+        self.cmp.do.update_many({'_id': 1}, {'$set': {'a': {'b': 1, 'c': 2}}}, upsert=True)
+        self.cmp.do.update_many({'_id': 1}, {'$unset': {'a.b': False}})
         self.cmp.compare.find()
 
-        self.cmp.do.update({'_id': 1}, {'$set': {'a': {'b': 1}}}, upsert=True)
-        self.cmp.do.update({'_id': 1}, {'$unset': {'a.b': True}})
+        self.cmp.do.update_many({'_id': 1}, {'$set': {'a': {'b': 1}}}, upsert=True)
+        self.cmp.do.update_many({'_id': 1}, {'$unset': {'a.b': True}})
         self.cmp.compare.find()
 
-        self.cmp.do.update({'_id': 1}, {'$set': {'a': {'b': 1}}}, upsert=True)
-        self.cmp.do.update({'_id': 1}, {'$unset': {'a.b': False}})
+        self.cmp.do.update_many({'_id': 1}, {'$set': {'a': {'b': 1}}}, upsert=True)
+        self.cmp.do.update_many({'_id': 1}, {'$unset': {'a.b': False}})
         self.cmp.compare.find()
 
     def test__unset_positional(self):
         self.cmp.do.insert_one({'a': 1, 'b': [{'c': 2, 'd': 3}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'a': 1, 'b': {'$elemMatch': {'c': 2, 'd': 3}}},
             {'$unset': {'b.$.c': ''}}
         )
@@ -1360,172 +1464,185 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
 
     def test__set_upsert(self):
         self.cmp.do.delete_many({})
-        self.cmp.do.update({'name': 'bob'}, {'$set': {'age': 1}}, True)
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'age': 1}}, True)
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'alice'}, {'$set': {'age': 1}}, True)
+        self.cmp.do.update_many({'name': 'alice'}, {'$set': {'age': 1}}, True)
         self.cmp.compare_ignore_order.find()
 
     def test__set_subdocument_array(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [0, 0]})
         self.cmp.do.insert_one({'name': 'bob', 'some_field': 'B', 'data': [0, 0]})
-        self.cmp.do.update({'name': 'bob'}, {'$set': {'some_field': 'A', 'data.1': 3}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'some_field': 'A', 'data.1': 3}})
         self.cmp.compare.find()
 
     def test__set_subdocument_array_bad_index_after_dot(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'some_field': 'B', 'data': [0, 0]})
-        self.cmp.do.update({'name': 'bob'}, {'$set': {'some_field': 'A', 'data.3': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$set': {'some_field': 'A', 'data.3': 1}})
         self.cmp.compare.find()
 
     def test__set_subdocument_array_bad_neg_index_after_dot(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'some_field': 'B', 'data': [0, 0]})
 
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$set': {'data.-3': 1}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$set': {'data.-3': 1}})
 
     def test__set_subdocuments_positional(self):
         self.cmp.do.insert_one({'name': 'bob', 'subdocs': [
             {'id': 1, 'name': 'foo'},
             {'id': 2, 'name': 'bar'}
         ]})
-        self.cmp.do.update({'name': 'bob', 'subdocs.id': 2},
-                           {'$set': {'subdocs.$': {'id': 3, 'name': 'baz'}}})
+        self.cmp.do.update_many(
+            {'name': 'bob', 'subdocs.id': 2},
+            {'$set': {'subdocs.$': {'id': 3, 'name': 'baz'}}})
         self.cmp.compare.find()
 
     def test__inc(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update({'name': 'bob'}, {'$inc': {'count': 1}})
+            self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'count': 1}})
             self.cmp.compare.find({'name': 'bob'})
 
     def test__max(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
         for i in range(3):
-            self.cmp.do.update({'name': 'bob'}, {'$max': {'count': i}})
+            self.cmp.do.update_many({'name': 'bob'}, {'$max': {'count': i}})
             self.cmp.compare.find({'name': 'bob'})
 
     def test__min(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
         for i in range(3):
-            self.cmp.do.update({'name': 'bob'}, {'$min': {'count': i}})
+            self.cmp.do.update_many({'name': 'bob'}, {'$min': {'count': i}})
             self.cmp.compare.find({'name': 'bob'})
 
     def test__inc_upsert(self):
         self.cmp.do.delete_many({})
         for _ in range(3):
-            self.cmp.do.update({'name': 'bob'}, {'$inc': {'count': 1}}, True)
+            self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'count': 1}}, True)
             self.cmp.compare.find({'name': 'bob'})
 
     def test__inc_subdocument(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': {'age': 0}})
-        self.cmp.do.update({'name': 'bob'}, {'$inc': {'data.age': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'data.age': 1}})
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'bob'}, {'$inc': {'data.age2': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'data.age2': 1}})
         self.cmp.compare.find()
 
     def test__inc_subdocument_array(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [0, 0]})
-        self.cmp.do.update({'name': 'bob'}, {'$inc': {'data.1': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'data.1': 1}})
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'bob'}, {'$inc': {'data.1': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'data.1': 1}})
         self.cmp.compare.find()
 
     def test__inc_subdocument_array_bad_index_after_dot(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [0, 0]})
-        self.cmp.do.update({'name': 'bob'}, {'$inc': {'data.3': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$inc': {'data.3': 1}})
         self.cmp.compare.find()
 
     def test__inc_subdocument_array_bad_neg_index_after_dot(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [0, 0]})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$inc': {'data.-3': 1}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$inc': {'data.-3': 1}})
 
     def test__inc_subdocument_positional(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [{'age': 0}, {'age': 1}]})
-        self.cmp.do.update({'name': 'bob', 'data': {'$elemMatch': {'age': 0}}},
-                           {'$inc': {'data.$.age': 1}})
+        self.cmp.do.update_many(
+            {'name': 'bob', 'data': {'$elemMatch': {'age': 0}}},
+            {'$inc': {'data.$.age': 1}})
         self.cmp.compare.find()
 
     def test__setOnInsert(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$setOnInsert': {'age': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$setOnInsert': {'age': 1}})
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'ann'}, {'$setOnInsert': {'age': 1}})
+        self.cmp.do.update_many({'name': 'ann'}, {'$setOnInsert': {'age': 1}})
         self.cmp.compare.find()
 
     def test__setOnInsert_upsert(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$setOnInsert': {'age': 1}}, True)
+        self.cmp.do.update_many({'name': 'bob'}, {'$setOnInsert': {'age': 1}}, True)
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'ann'}, {'$setOnInsert': {'age': 1}}, True)
+        self.cmp.do.update_many({'name': 'ann'}, {'$setOnInsert': {'age': 1}}, True)
         self.cmp.compare.find()
 
     def test__setOnInsert_subdocument(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': {'age': 0}})
-        self.cmp.do.update({'name': 'bob'}, {'$setOnInsert': {'data.age': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$setOnInsert': {'data.age': 1}})
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'bob'}, {'$setOnInsert': {'data.age1': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$setOnInsert': {'data.age1': 1}})
         self.cmp.compare.find()
-        self.cmp.do.update({'name': 'ann'}, {'$setOnInsert': {'data.age': 1}})
+        self.cmp.do.update_many({'name': 'ann'}, {'$setOnInsert': {'data.age': 1}})
         self.cmp.compare.find()
 
     def test__setOnInsert_subdocument_upsert(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': {'age': 0}})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$setOnInsert': {'data.age': 1}}, True)
         self.cmp.compare.find()
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$setOnInsert': {'data.age1': 1}}, True)
         self.cmp.compare.find()
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'ann'}, {'$setOnInsert': {'data.age': 1}}, True)
         self.cmp.compare.find()
 
     def test__setOnInsert_subdocument_elemMatch(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [{'age': 0}, {'age': 1}]})
-        self.cmp.do.update({'name': 'bob', 'data': {'$elemMatch': {'age': 0}}},
-                           {'$setOnInsert': {'data.$.age': 1}})
+        self.cmp.do.update_many(
+            {'name': 'bob', 'data': {'$elemMatch': {'age': 0}}},
+            {'$setOnInsert': {'data.$.age': 1}})
         self.cmp.compare.find()
 
     def test__inc_subdocument_positional_upsert(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'data': [{'age': 0}, {'age': 1}]})
-        self.cmp.do.update({'name': 'bob', 'data': {'$elemMatch': {'age': 0}}},
-                           {'$setOnInsert': {'data.$.age': 1}}, True)
+        self.cmp.do.update_many(
+            {'name': 'bob', 'data': {'$elemMatch': {'age': 0}}},
+            {'$setOnInsert': {'data.$.age': 1}}, True)
         self.cmp.compare.find()
+
+    def test__set_dollar_operand(self):
+        self.cmp.do.delete_many({})
+        self.cmp.do.insert_one({'recordId': 1234, 'app': [
+            {'application': 'AppName', 'code': 1234, 'property': 'oldValue'},
+            {'application': 'AppName1', 'code': 1235, 'property': 'oldValue1'}]})
+        self.cmp.do.update_many(
+            {'app': {'$elemMatch': {'application': 'AppName', 'code': 1234}}},
+            {'$set': {'app.$': {'application': 'AppName', 'code': 1234, 'property': 'newValue'}}})
 
     def test__addToSet(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update({'name': 'bob'}, {'$addToSet': {'hat': 'green'}})
+            self.cmp.do.update_many({'name': 'bob'}, {'$addToSet': {'hat': 'green'}})
             self.cmp.compare.find({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update({'name': 'bob'}, {'$addToSet': {'hat': 'tall'}})
+            self.cmp.do.update_many({'name': 'bob'}, {'$addToSet': {'hat': 'tall'}})
             self.cmp.compare.find({'name': 'bob'})
 
     def test__addToSet_nested(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update(
+            self.cmp.do.update_many(
                 {'name': 'bob'}, {'$addToSet': {'hat.color': 'green'}})
             self.cmp.compare.find({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update(
+            self.cmp.do.update_many(
                 {'name': 'bob'}, {'$addToSet': {'hat.color': 'tall'}})
             self.cmp.compare.find({'name': 'bob'})
 
@@ -1533,84 +1650,91 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update(
+            self.cmp.do.update_many(
                 {'name': 'bob'},
                 {'$addToSet': {'hat': {'$each': ['green', 'yellow']}}})
             self.cmp.compare.find({'name': 'bob'})
         for _ in range(3):
-            self.cmp.do.update(
+            self.cmp.do.update_many(
                 {'name': 'bob'},
                 {'$addToSet': {'shirt.color': {'$each': ['green', 'yellow']}}})
             self.cmp.compare.find({'name': 'bob'})
 
+    def test__addToSet_dollar_operand(self):
+        self.cmp.do.delete_many({})
+        self.cmp.do.insert_one({'takes': [{'a': 2, 'tags': []}, {'a': 1, 'tags': [2]}]})
+        self.cmp.do.update_many(
+            {'takes': {'$elemMatch': {'a': 1}}},
+            {'$addToSet': {'takes.$.tags': 3}})
+
     def test__pop(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
-        self.cmp.do.update({'name': 'bob'}, {'$pop': {'hat': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pop': {'hat': 1}})
         self.cmp.compare.find({'name': 'bob'})
 
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
-        self.cmp.do.update({'name': 'bob'}, {'$pop': {'hat': -1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pop': {'hat': -1}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pop_invalid_type(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': 'green'})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$pop': {'hat': 1}})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$pop': {'hat': -1}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$pop': {'hat': 1}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$pop': {'hat': -1}})
 
     def test__pop_invalid_syntax(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green']})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$pop': {'hat': 2}})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$pop': {'hat': '5'}})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$pop': {'hat.-1': 1}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$pop': {'hat': 2}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$pop': {'hat': '5'}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$pop': {'hat.-1': 1}})
 
     def test__pop_array_in_array(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': [['green']]})
-        self.cmp.do.update({'name': 'bob'}, {'$pop': {'hat.0': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pop': {'hat.0': 1}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pop_too_far_in_array(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': [['green']]})
-        self.cmp.do.update({'name': 'bob'}, {'$pop': {'hat.50': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pop': {'hat.50': 1}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pop_document_in_array(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': [{'hat': ['green']}]})
-        self.cmp.do.update({'name': 'bob'}, {'$pop': {'hat.0.hat': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pop': {'hat.0.hat': 1}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pop_invalid_document_in_array(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': [{'hat': 'green'}]})
-        self.cmp.compare_exceptions.update({'name': 'bob'}, {'$pop': {'hat.0.hat': 1}})
+        self.cmp.compare_exceptions.update_many({'name': 'bob'}, {'$pop': {'hat.0.hat': 1}})
 
     def test__pop_empty(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': []})
-        self.cmp.do.update({'name': 'bob'}, {'$pop': {'hat': 1}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pop': {'hat': 1}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pull(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$pull': {'hat': 'green'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pull': {'hat': 'green'}})
         self.cmp.compare.find({'name': 'bob'})
 
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
-        self.cmp.do.update({'name': 'bob'}, {'$pull': {'hat': 'green'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pull': {'hat': 'green'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pull_query(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': [{'size': 5}, {'size': 10}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$pull': {'hat': {'size': {'$gt': 6}}}})
         self.cmp.compare.find({'name': 'bob'})
 
@@ -1618,7 +1742,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.do.insert_one(
             {'name': 'bob', 'hat': {'sizes': [{'size': 5}, {'size': 8}, {'size': 10}]}}
         )
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$pull': {'hat.sizes': {'size': {'$gt': 6}}}})
         self.cmp.compare.find({'name': 'bob'})
 
@@ -1647,7 +1771,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
                  'sizes': [{'size': 'S', 'quantity': 10},
                            {'size': 'L', 'quantity': 5}],
                  'colors': ['blue']}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'hat': {'$elemMatch': {'name': 'derby'}}},
             {'$pull': {'hat.$.sizes': {'size': 'L'}}})
         self.cmp.compare.find({'name': 'bob'})
@@ -1658,7 +1782,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
             {'name': 'bob', 'hat':
              [{'name': 'derby', 'sizes': ['L', 'XL']},
               {'name': 'cap', 'sizes': ['S', 'L']}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'hat': {'$elemMatch': {'name': 'derby'}}},
             {'$pull': {'hat.$.sizes': 'XL'}})
         self.cmp.compare.find({'name': 'bob'})
@@ -1666,53 +1790,49 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one(
             {'name': 'bob', 'hat': {'nested': ['element1', 'element2', 'element1']}})
-        self.cmp.do.update({'name': 'bob'}, {'$pull': {'hat.nested': 'element1'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pull': {'hat.nested': 'element1'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__pullAll(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$pullAll': {'hat': ['green']}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pullAll': {'hat': ['green']}})
         self.cmp.compare.find({'name': 'bob'})
 
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$pullAll': {'hat': ['green', 'blue']}})
         self.cmp.compare.find({'name': 'bob'})
 
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green', 'tall', 'blue']})
-        self.cmp.do.update({'name': 'bob'}, {'$pullAll': {'hat': ['green']}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$pullAll': {'hat': ['green']}})
         self.cmp.compare.find({'name': 'bob'})
 
-    def test__pullAll_nested_dict(self):
+    def test__pullAll_dollar_operand(self):
         self.cmp.do.delete_many({})
-        self.cmp.do.insert_one(
-            {'name': 'bob', 'hat': {'properties': {'sizes': ['M', 'L', 'XL']}}})
-        self.cmp.do.update(
-            {'name': 'bob'}, {'$pullAll': {'hat.properties.sizes': ['M']}})
-        self.cmp.compare.find({'name': 'bob'})
-
-        self.cmp.do.delete_many({})
-        self.cmp.do.insert_one(
-            {'name': 'bob', 'hat': {'properties': {'sizes': ['M', 'L', 'XL']}}})
-        self.cmp.do.update(
-            {'name': 'bob'},
-            {'$pullAll': {'hat.properties.sizes': ['M', 'L']}})
+        self.cmp.do.insert_one({'name': 'bob', 'takes': [
+            {'a': 1, 'tags': [0, 1, 2, 4]},
+            {'a': 2, 'tags': [0, 1, 2, 4]},
+            {'a': 1, 'tags': [0, 1, 4]},
+            {'a': 1, 'tags': [2, 3, 5]}]})
+        self.cmp.do.update_many(
+            {'name': 'bob', 'takes': {'$elemMatch': {'a': 1}}},
+            {'$pullAll': {'takes.$.tags': [1, 2, 3]}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__push(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
-        self.cmp.do.update({'name': 'bob'}, {'$push': {'hat': 'wide'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$push': {'hat': 'wide'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__push_dict(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one(
             {'name': 'bob', 'hat': [{'name': 'derby', 'sizes': ['L', 'XL']}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'},
             {'$push': {'hat': {'name': 'cap', 'sizes': ['S', 'L']}}})
         self.cmp.compare.find({'name': 'bob'})
@@ -1720,7 +1840,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
     def test__push_each(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$push': {'hat': {'$each': ['wide', 'blue']}}})
         self.cmp.compare.find({'name': 'bob'})
 
@@ -1737,7 +1857,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
                  'sizes': [{'size': 'S', 'quantity': 10},
                            {'size': 'L', 'quantity': 5}],
                  'colors': ['blue']}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'hat': {'$elemMatch': {'name': 'derby'}}},
             {'$push': {'hat.$.sizes': {'size': 'M', 'quantity': 6}}})
         self.cmp.compare.find({'name': 'bob'})
@@ -1755,7 +1875,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
                  'sizes': [{'size': 'S', 'quantity': 10},
                            {'size': 'L', 'quantity': 5}],
                  'colors': ['blue']}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'hat': {'$elemMatch': {'name': 'derby'}}},
             {'$push':
              {'hat.$.sizes':
@@ -1776,7 +1896,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
                  'sizes': [{'size': 'S', 'quantity': 10},
                            {'size': 'L', 'quantity': 5}],
                  'colors': ['blue']}]})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'},
             {'$push': {'hat.1.sizes': {'size': 'M', 'quantity': 6}}})
         self.cmp.compare.find({'name': 'bob'})
@@ -1793,7 +1913,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
                  'colors': ['blue']}
             ]
         })
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'hat': {'$elemMatch': {'name': 'derby'}}},
             {'$push': {'hat.$.sizes': {'$each': ['M', 'S']}}})
         self.cmp.compare.find({'name': 'bob'})
@@ -1801,32 +1921,32 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
     def test__push_nested_attribute(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': {'data': {'sizes': ['XL']}}})
-        self.cmp.do.update({'name': 'bob'}, {'$push': {'hat.data.sizes': 'L'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$push': {'hat.data.sizes': 'L'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__push_nested_attribute_each(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob', 'hat': {}})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$push': {'hat.first': {'$each': ['a', 'b']}}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__push_to_absent_nested_attribute(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$push': {'hat.data.sizes': 'L'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$push': {'hat.data.sizes': 'L'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__push_to_absent_field(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update({'name': 'bob'}, {'$push': {'hat': 'wide'}})
+        self.cmp.do.update_many({'name': 'bob'}, {'$push': {'hat': 'wide'}})
         self.cmp.compare.find({'name': 'bob'})
 
     def test__push_each_to_absent_field(self):
         self.cmp.do.delete_many({})
         self.cmp.do.insert_one({'name': 'bob'})
-        self.cmp.do.update(
+        self.cmp.do.update_many(
             {'name': 'bob'}, {'$push': {'hat': {'$each': ['wide', 'blue']}}})
         self.cmp.compare.find({'name': 'bob'})
 
@@ -1917,6 +2037,9 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare.find({})
 
     def test__ensure_index(self):
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.ensure_index('name')
+            return
         self.cmp.compare.ensure_index('name')
         self.cmp.compare.ensure_index('hat', cache_for=100)
         self.cmp.compare.ensure_index([('name', 1), ('hat', -1)])
@@ -1925,13 +2048,13 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
 
     def test__drop_index(self):
         self.cmp.do.insert_one({})
-        self.cmp.compare.ensure_index([('name', 1), ('hat', -1)])
+        self.cmp.compare.create_index([('name', 1), ('hat', -1)])
         self.cmp.compare.drop_index([('name', 1), ('hat', -1)])
         self.cmp.compare.index_information()
 
     def test__drop_index_by_name(self):
         self.cmp.do.insert_one({})
-        results = self.cmp.compare.ensure_index('name')
+        results = self.cmp.compare.create_index('name')
         self.cmp.compare.drop_index(results['real'])
         self.cmp.compare.index_information()
 
@@ -1944,7 +2067,7 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
         self.cmp.compare_ignore_order.sort_by(lambda i: i['name']).list_indexes()
 
     def test__empty_logical_operators(self):
-        for operator in mongomock.filtering.LOGICAL_OPERATOR_MAP:
+        for operator in ('$or', '$and', '$nor'):
             self.cmp.compare_exceptions.find({operator: []})
 
     def test__rename(self):
@@ -1977,9 +2100,34 @@ class MongoClientCollectionTest(_CollectionComparisonTest):
             'three_not_equal': {'$setEquals': [['one', 'three'], ['two', 'one'], ['two', 'one']]},
         }}])
 
+    @skipIf(
+        helpers.PYMONGO_VERSION < version.parse('4.0'), 'pymongo v4 dropped map reduce methods')
+    def test__map_reduce_fails(self):
+        self.cmp.compare_exceptions.map_reduce(Code(''), Code(''), 'myresults')
+        self.cmp.compare_exceptions.inline_map_reduce(Code(''), Code(''))
+        self.cmp.compare_exceptions.group(['a'], {'a': {'$lt': 3}}, {'count': 0}, Code('''
+            function(cur, result) { result.count += cur.count }
+        '''))
+
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 dropped group method')
+    @skipIf(helpers.PYMONGO_VERSION < version.parse('3.6'), 'pymongo v3.6 broke group method')
+    def test__group_fails(self):
+        self.cmp.compare_exceptions.group(['a'], {'a': {'$lt': 3}}, {'count': 0}, Code('''
+            function(cur, result) { result.count += cur.count }
+        '''))
+
+    def test__aggregate_system_variables_generate_array(self):
+        self.cmp.do.drop()
+        self.cmp.do.insert_one(
+            {'name': 'foo', 'errors': [
+                {'error_type': 1, 'description': 'problem 1'},
+                {'error_type': 2, 'description': 'problem 2'}]})
+        self.cmp.compare.aggregate([{'$project': {'error_type': '$$ROOT.errors.error_type'}}])
+
 
 @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
 @skipIf(not _HAVE_MAP_REDUCE, 'execjs not installed')
+@skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 dropped map reduce')
 class CollectionMapReduceTest(TestCase):
 
     def setUp(self):
@@ -2029,7 +2177,7 @@ class CollectionMapReduceTest(TestCase):
         result = colc.map_reduce(self.map_func, self.reduce_func, 'myresults')
         self.assertIsInstance(result, mongomock.Collection)
         self.assertEqual(result.name, 'myresults')
-        self.assertEqual(result.count(), len(expected_results))
+        self.assertEqual(result.count_documents({}), len(expected_results))
         for doc in result.find():
             self.assertIn(doc, expected_results)
 
@@ -2040,7 +2188,7 @@ class CollectionMapReduceTest(TestCase):
         self.assertIsInstance(result, mongomock.Collection)
         self.assertEqual(result.name, 'results')
         self.assertEqual(result.database.name, 'map_reduce_son_test')
-        self.assertEqual(result.count(), 3)
+        self.assertEqual(result.count_documents({}), 3)
         for doc in result.find():
             self.assertIn(doc, self.expected_results)
 
@@ -2074,7 +2222,7 @@ class CollectionMapReduceTest(TestCase):
             'myresults', query={'tags': 'dog'})
         self.assertIsInstance(result, mongomock.Collection)
         self.assertEqual(result.name, 'myresults')
-        self.assertEqual(result.count(), 3)
+        self.assertEqual(result.count_documents({}), 3)
         for doc in result.find():
             self.assertIn(doc, expected_results)
 
@@ -2083,7 +2231,7 @@ class CollectionMapReduceTest(TestCase):
             self.map_func, self.reduce_func, 'myresults', limit=2)
         self.assertIsInstance(result, mongomock.Collection)
         self.assertEqual(result.name, 'myresults')
-        self.assertEqual(result.count(), 2)
+        self.assertEqual(result.count_documents({}), 2)
 
     def test__inline_map_reduce(self):
         result = self.db.things.inline_map_reduce(
@@ -2128,7 +2276,7 @@ class CollectionMapReduceTest(TestCase):
             self.map_func, self.reduce_func, 'myresults')
         self.assertIsInstance(result, mongomock.Collection)
         self.assertEqual(result.name, 'myresults')
-        self.assertEqual(result.count(), 2)
+        self.assertEqual(result.count_documents({}), 2)
         for doc in result.find():
             self.assertIn(doc, expected_results)
 
@@ -2169,12 +2317,13 @@ class CollectionMapReduceTest(TestCase):
             map_function, reduce_function, 'my_collection', query=search_query)
 
         # Assert
-        self.assertEqual(result.count(), 3)
+        self.assertEqual(result.count_documents({}), 3)
 
 
 @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
 @skipIf(not _HAVE_MAP_REDUCE, 'execjs not installed')
-class _GroupTest(_CollectionComparisonTest):
+@skipIf(helpers.PYMONGO_VERSION >= version.parse('3.6'), 'pymongo v3.6 broke group')
+class GroupTest(_CollectionComparisonTest):
 
     def setUp(self):
         _CollectionComparisonTest.setUp(self)
@@ -2192,8 +2341,7 @@ class _GroupTest(_CollectionComparisonTest):
             {'b': 1, 'foo': 2},
             {'b': 1, 'foo': self._id1},
         ]
-        for item in self.data:
-            self.cmp.do.insert_one(item)
+        self.cmp.do.insert_many(self.data)
 
     def test__group1(self):
         key = ['a']
@@ -2602,10 +2750,10 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
         result = list(aggregations['fake'])
         self.assertEqual(len(result), len(expected))
         for expected_elt, result_elt in zip(expected, result):
-            assertCountEqual(self, expected_elt.keys(), result_elt.keys())
+            self.assertCountEqual(expected_elt.keys(), result_elt.keys())
             for key in result_elt:
                 if isinstance(result_elt[key], list):
-                    assertCountEqual(self, result_elt[key], expected_elt[key], msg=key)
+                    self.assertCountEqual(result_elt[key], expected_elt[key], msg=key)
                 else:
                     self.assertEqual(result_elt[key], expected_elt[key], msg=key)
 
@@ -3109,6 +3257,20 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
             }},
         ])
 
+    def test__aggregate_array_eleme_at(self):
+        self.cmp.do.drop()
+        self.cmp.do.insert_many([
+            {'values_list': [1, 2]},
+            {'values_list': [1, 2, 3]},
+        ])
+
+        self.cmp.compare.aggregate([{
+            '$project': {
+                'first_user_id': {'$arrayElemAt': ['$values_list', 2]},
+                'other_user_id': {'$arrayElemAt': ['$values_list', -1]},
+            },
+        }])
+
     def test_aggregate_bug_607(self):
         """Regression test for bug https://github.com/mongomock/mongomock/issues/607."""
         self.cmp.do.drop()
@@ -3124,6 +3286,18 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
         self.cmp.compare.aggregate([
             {'$project': {
                 'values_index': {'$arrayElemAt': ['$values', {'$add': [1, 1]}]}
+            }}
+        ])
+
+    def test__aggregate_first_last_in_array(self):
+        self.cmp.do.drop()
+        self.cmp.do.insert_one({
+            'values': [0, 1, 5]
+        })
+        self.cmp.compare.aggregate([
+            {'$project': {
+                'first': {'$first': '$values'},
+                'last': {'$last': '$values'},
             }}
         ])
 
@@ -3225,6 +3399,68 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
             'input': '$items',
             'cond': {'$lt': ['$$this.price', 100]},
         }}}}])
+
+    def test__aggregate_map(self):
+        self.cmp.do.insert_one({
+            'array': [1, 2, 3, 4],
+        })
+        self.cmp.compare.aggregate([{'$project': {
+            '_id': 0,
+            'array': {'$map': {
+                'input': '$array',
+                'in': {'$multiply': ['$$this', '$$this']},
+            }},
+            'custom_variable': {'$map': {
+                'input': '$array',
+                'as': 'self',
+                'in': {'$multiply': ['$$self', '$$self']},
+            }},
+            'empty': {'$map': {
+                'input': [],
+                'in': {'$multiply': ['$$this', '$$this']},
+            }},
+            'null': {'$map': {
+                'input': None,
+                'in': '$$this',
+            }},
+            'missing': {'$map': {
+                'input': '$missing.key',
+                'in': '$$this',
+            }},
+        }}])
+
+    def test__aggregate_filter_in_arrayElemAt(self):
+        self.cmp.do.drop()
+        self.cmp.do.insert_many([
+            {
+                '_id': 0,
+                'items': [
+                    {'item_id': 11, 'category': 'book'},
+                    {'item_id': 234, 'category': 'journal'}
+                ]
+            },
+            {
+                '_id': 1,
+                'items': [
+                    {'item_id': 23, 'category': 'book'}
+                ]
+            },
+            {
+                '_id': 2,
+                'items': [
+                    {'item_id': 232, 'category': 'book'}
+                ]
+            }
+        ])
+        self.cmp.compare.aggregate([{'$project': {'item': {
+            '$arrayElemAt': [
+                {'$filter': {
+                    'input': '$items',
+                    'cond': {'$eq': ['$$this.category', 'book']}
+                }},
+                0
+            ]
+        }}}])
 
     def test__aggregate_slice(self):
         self.cmp.do.drop()
@@ -3360,6 +3596,40 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
             }}
         ]
         self.cmp.compare.aggregate(pipeline)
+
+    def test__aggregate36(self):
+        self.cmp.compare.aggregate([{'$project': {'c': {'$abs': -2}}}])
+        self.cmp.compare.aggregate([{'$project': {'d': {'$floor': 2.3}}}])
+        self.cmp.compare.aggregate([{'$project': {'e': {'$ln': None}}}])
+        self.cmp.compare.aggregate([{'$project': {'f': {'$exp': '$non_existent_key'}}}])
+        self.cmp.compare.aggregate([{'$project': {'g': {'$divide': [7, 3]}}}])
+        self.cmp.compare.aggregate([{'$project': {'h': {'$log': [None, 1]}}}])
+        self.cmp.compare.aggregate([{'$project': {'i': {'$mod': [1, None]}}}])
+        self.cmp.compare.aggregate([{'$project': {'j': {'$pow': [None, None]}}}])
+        self.cmp.compare.aggregate([{'$project': {'k': {'$subtract': [None, 1]}}}])
+        self.cmp.compare.aggregate([{'$project': {'k': {'$subtract': ['$non_existent_key', 1]}}}])
+        self.cmp.compare.aggregate([{'$project': {'o': {'$multiply': [4]}}}])
+        self.cmp.compare.aggregate([{'$project': {'p': {'$add': [1, 2, 3]}}}])
+        self.cmp.compare.aggregate([{'$project': {'s': {'$multiply': [1, None]}}}])
+        self.cmp.compare.aggregate([{'$project': {'t': {'$add': [None, 1]}}}])
+        self.cmp.compare.aggregate([{'$project': {'u': {'$multiply': ['$a', '$b', 4]}}}])
+
+    def test__aggregate_exception(self):
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$abs': [-2, 4]}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$floor': []}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$divide': 5}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$log': [5]}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$mod': [5, 3, 1]}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$sum': []}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'c': {'$multiply': []}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'n': {'$add': '$a'}}}])
+        self.cmp.compare_exceptions.aggregate(
+            [{'$project': {'q': {'$multiply': [1, '$non_existent_key']}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'r': {'$add': '$non_existent_key'}}}])
+        self.cmp.compare_exceptions.aggregate([{'$project': {'v': {'$multiply': '$b'}}}])
+        # TODO(pascal): Enable this test, for now it's not the same kind of error.
+        # self.cmp.compare_exceptions.aggregate(
+        #     [{'$project': {'c': {'$add': ['$date', 1, '$date']}}}])
 
     def test__aggregate_add_fields_with_sum_avg(self):
         self.cmp.do.delete_many({})
@@ -3583,6 +3853,32 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
         self.cmp.do.create_index([('value', 1)])
         self.cmp.compare_exceptions.create_index([('value', 1)], unique=True)
 
+    def test__partial_filter_expression_unique_index(self):
+        self.cmp.do.delete_many({})
+        self.cmp.do.create_index(
+            (('value', 1), ('partialFilterExpression_value', 1)), unique=True,
+            partialFilterExpression={'partialFilterExpression_value': {'$exists': True}})
+
+        # We should be able to add documents with duplicated `value` if
+        # partialFilterExpression_value isn't set.
+        self.cmp.do.insert_one({'value': 4})
+        self.cmp.do.insert_one({'value': 4})
+        self.cmp.compare.find({'value': 4})
+
+        # We should be able to add documents with distinct `value` values and duplicated
+        # `partialFilterExpression_value` value.
+        self.cmp.do.insert_one({'partialFilterExpression_value': 1, 'value': 2})
+        self.cmp.do.insert_one({'partialFilterExpression_value': 1, 'value': 3})
+        self.cmp.compare.find({'partialFilterExpression_value': 1})
+
+        # We should not be able to add documents with duplicated `partialFilterExpression_value`
+        # and `value` values.
+        self.cmp.do.insert_one({'partialFilterExpression_value': 2, 'value': 3})
+        self.cmp.compare_exceptions.insert_one({'partialFilterExpression_value': 2, 'value': 3})
+        self.cmp.compare.find({'partialFilterExpression_value': 2, 'value': 3})
+
+        self.cmp.compare.find({})
+
     def test_aggregate_project_with_boolean(self):
         self.cmp.do.drop()
 
@@ -3783,6 +4079,84 @@ class MongoClientAggregateTest(_CollectionComparisonTest):
         ]
         self.cmp.compare_ignore_order.aggregate(pipeline)
 
+    def test__add_fields(self):
+        self.cmp.compare.aggregate([{'$addFields': {'c': 3}}])
+        self.cmp.compare.aggregate([{'$addFields': {'c': 4}}])
+        self.cmp.compare.aggregate([{'$addFields': {'b': {'$add': ['$a', '$b', 5]}}}])
+
+    def test__aggregate_with_missing_fields1(self):
+        self.cmp.do.delete_many({})
+
+        data = [
+            {'_id': ObjectId(), 'a': 0, 'b': 1},
+            {'_id': ObjectId(), 'a': 0},
+            {'_id': ObjectId()},
+        ]
+        self.cmp.do.insert_many(data)
+
+        pipeline = [
+            {'$group': {'_id': '$a', 'b': {'$sum': '$b'}}},
+        ]
+        self.cmp.compare_ignore_order.aggregate(pipeline)
+
+    def test__group_with_missing_fields1(self):
+        self.cmp.do.delete_many({})
+
+        data = [
+            {'_id': ObjectId(), 'a': 0, 'b': 0},
+            {'_id': ObjectId(), 'a': 0},
+            {'_id': ObjectId(), 'b': 0},
+            {'_id': ObjectId()},
+        ]
+        self.cmp.do.insert_many(data)
+
+        pipeline = [
+            {'$group': {'_id': {'a': '$a', 'b': '$b'}}},
+        ]
+        self.cmp.compare_ignore_order.aggregate(pipeline)
+
+    def test__group_with_missing_fields2(self):
+        self.cmp.do.delete_many({})
+
+        data = [
+            {'_id': ObjectId(), 'a': 0},
+            {'_id': ObjectId()},
+        ]
+        self.cmp.do.insert_many(data)
+
+        pipeline = [
+            {'$group': {'_id': {'a': '$a'}}},
+        ]
+        self.cmp.compare_ignore_order.aggregate(pipeline)
+
+    def test__group_with_missing_fields3(self):
+        self.cmp.do.delete_many({})
+
+        data = [
+            {'_id': ObjectId(), 'a': 0},
+            {'_id': ObjectId()},
+        ]
+        self.cmp.do.insert_many(data)
+
+        pipeline = [
+            {'$group': {'_id': '$a'}},
+        ]
+        self.cmp.compare_ignore_order.aggregate(pipeline)
+
+    def test__add_fields_with_missing_fields(self):
+        self.cmp.do.delete_many({})
+
+        data = [
+            {'a': 0},
+            {},
+        ]
+        self.cmp.do.insert_many(data)
+
+        pipeline = [
+            {'$addFields': {'b': '$a'}},
+        ]
+        self.cmp.compare_ignore_order.aggregate(pipeline)
+
 
 @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
 class MongoClientGraphLookupTest(_CollectionComparisonTest):
@@ -3947,11 +4321,26 @@ def _SORT(*args):
     return lambda cursor: cursor.sort(*args)
 
 
+def _COUNT(cursor):
+    return cursor.count()
+
+
+def _COUNT_EXCEPTION_TYPE(cursor):
+    try:
+        cursor.count()
+    except Exception as error:
+        return str(type(error))
+
+    assert False, 'Count should have failed'
+
+
 def _DISTINCT(*args):
-    return lambda cursor: sorted(
-        helpers.hashdict(v) if isinstance(v, dict) else v
-        for v in cursor.distinct(*args)
-    )
+    def sortkey(value):
+        if isinstance(value, dict):
+            return [(k, sortkey(v)) for k, v in sorted(value.items())]
+        return value
+
+    return lambda cursor: sorted(cursor.distinct(*args), key=sortkey)
 
 
 def _SKIP(*args):
@@ -3978,6 +4367,18 @@ class MongoClientSortSkipLimitTest(_CollectionComparisonTest):
 
     def test__skip_and_limit(self):
         self.cmp.compare(_SORT('index', 1), _SKIP(10), _LIMIT(10)).find()
+
+    @skipIf(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'Cursor.count was removed in pymongo 4')
+    def test__count(self):
+        self.cmp.compare(_COUNT).find()
+
+    @skipUnless(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'Cursor.count was removed in pymongo 4')
+    def test__count_fail(self):
+        self.cmp.compare(_COUNT_EXCEPTION_TYPE).find()
 
     def test__sort_name(self):
         self.cmp.do.delete_many({})
@@ -4066,6 +4467,13 @@ class MongoClientSortSkipLimitTest(_CollectionComparisonTest):
         self.cmp.do.insert_one({'f1': [{'f2': 'v'}, {'f2': 'w'}]})
         self.cmp.compare(_DISTINCT('f1.f2')).find()
 
+    def test__distinct_array_field_with_dicts(self):
+        self.cmp.do.insert_many([
+            {'f1': [{'f2': 'v2'}, {'f3': 'v3'}]},
+            {'f1': [{'f3': 'v3'}, {'f4': 'v4'}]},
+        ])
+        self.cmp.compare(_DISTINCT('f1')).find()
+
 
 class InsertedDocumentTest(TestCase):
 
@@ -4084,9 +4492,12 @@ class InsertedDocumentTest(TestCase):
         [object] = self.collection.find({'_id': self.object_id})
         self.assertEqual(object, self.data)
 
+    @skipIf(
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'remove was removed in pymongo v4')
     def test__remove_by_id(self):
         self.collection.remove(self.object_id)
-        self.assertEqual(0, self.collection.find({}).count())
+        self.assertEqual(0, self.collection.count_documents({}))
 
     def test__inserting_changes_argument(self):
         # Like pymongo, we should fill the _id in the inserted dict
@@ -4119,15 +4530,40 @@ class ObjectIdTest(TestCase):
         self.assertEqual(obj1, obj2)
 
 
-class DatabasesNamesTest(TestCase):
+class MongoClientTest(_CollectionComparisonTest):
+    """Compares a fake connection with the real mongo connection implementation
+
+       This is done via cross-comparison of the results.
+    """
 
     def setUp(self):
-        super(DatabasesNamesTest, self).setUp()
-        self.client = mongomock.MongoClient()
+        super(MongoClientTest, self).setUp()
+        self.cmp = MultiCollection({'fake': self.fake_conn, 'real': self.mongo_conn})
 
     def test__database_names(self):
-        self.client.unit.tests.insert_one({'foo': 'bar'})
-        self.client.foo.bar.insert_one({'unit': 'test'})
-        names = self.client.database_names()
-        self.assertIsInstance(names, list)
-        self.assertEqual(sorted(['foo', 'unit']), sorted(names))
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.database_names()
+            return
+
+        self.cmp.do.database_names()
+
+
+class DatabaseTest(_CollectionComparisonTest):
+    """Compares a fake database with the real mongo database implementation
+
+       This is done via cross-comparison of the results.
+    """
+
+    def setUp(self):
+        super(DatabaseTest, self).setUp()
+        self.cmp = MultiCollection({
+            'fake': self.fake_conn[self.db_name],
+            'real': self.mongo_conn[self.db_name],
+        })
+
+    def test__database_names(self):
+        if helpers.PYMONGO_VERSION >= version.parse('4.0'):
+            self.cmp.compare_exceptions.collection_names()
+            return
+
+        self.cmp.do.collection_names()

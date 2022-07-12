@@ -1,17 +1,17 @@
 import os
 import time
 import unittest
-from unittest import TestCase, skipIf
+from unittest import TestCase, skipIf, skipUnless
 
 import mongomock
 import mongomock.gridfs
-from six import text_type
+from mongomock import helpers
+from packaging import version
 
 try:
     import gridfs
     from gridfs import errors
     _HAVE_GRIDFS = True
-    mongomock.gridfs.enable_gridfs_integration()
 except ImportError:
     _HAVE_GRIDFS = False
 
@@ -21,15 +21,18 @@ try:
 
     import pymongo
     from pymongo import MongoClient as PymongoClient
-    _HAVE_PYMONGO = True
 except ImportError:
-    _HAVE_PYMONGO = False
+    ...
 
 
-@skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
-@skipIf(not _HAVE_GRIDFS, 'gridfs not installed')
+@skipUnless(helpers.HAVE_PYMONGO, 'pymongo not installed')
+@skipUnless(_HAVE_GRIDFS and hasattr(gridfs.__builtins__, 'copy'), 'gridfs not installed')
 @skipIf(os.getenv('NO_LOCAL_MONGO'), 'No local Mongo server running')
 class GridFsTest(TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        mongomock.gridfs.enable_gridfs_integration()
 
     def setUp(self):
         super(GridFsTest, self).setUp()
@@ -81,7 +84,7 @@ class GridFsTest(TestCase):
         self.assertFalse(self.fake_gridfs.exists(fid))
         self.assertFalse(self.get_fake_file(fid) is not None)
         # All the chunks got removed
-        self.assertEqual(0, self.fake_conn[self.db_name].fs.chunks.find({}).count())
+        self.assertEqual(0, self.fake_conn[self.db_name].fs.chunks.count_documents({}))
 
     def test__delete_exists_big(self):
         fid = self.fake_gridfs.put(GenFile(500000))
@@ -91,7 +94,7 @@ class GridFsTest(TestCase):
         self.assertFalse(self.fake_gridfs.exists(fid))
         self.assertFalse(self.get_fake_file(fid) is not None)
         # All the chunks got removed
-        self.assertEqual(0, self.fake_conn[self.db_name].fs.chunks.find({}).count())
+        self.assertEqual(0, self.fake_conn[self.db_name].fs.chunks.count_documents({}))
 
     def test__delete_no_file(self):
         # Just making sure we don't crash
@@ -128,7 +131,7 @@ class GridFsTest(TestCase):
         c = self.fake_gridfs.find({'filename': 'a'}).sort('uploadDate', -1)
         should_be_fid3 = c.next()
         should_be_fid0 = c.next()
-        self.assertEqual(2, c.count())
+        self.assertFalse(c.alive)
 
         self.assertEqual(fids[3], should_be_fid3._id)
         self.assertEqual(fids[0], should_be_fid0._id)
@@ -139,7 +142,10 @@ class GridFsTest(TestCase):
             self.fake_gridfs.put(GenFile(2, 3), _id='12345')
 
     def assertSameFile(self, real, fake, max_delta_seconds=1):
-        self.assertEqual(real['md5'], fake['md5'])
+        # https://pymongo.readthedocs.io/en/stable/migrate-to-pymongo4.html#disable-md5-parameter-is-removed
+        if helpers.PYMONGO_VERSION < version.parse('4.0'):
+            self.assertEqual(real['md5'], fake['md5'])
+
         self.assertEqual(real['length'], fake['length'])
         self.assertEqual(real['chunkSize'], fake['chunkSize'])
         self.assertLessEqual(
@@ -179,7 +185,7 @@ class GenFile(object):
             yield value
 
     def _maybe_encode(self, s):
-        if self.do_encode and isinstance(s, text_type):
+        if self.do_encode and isinstance(s, str):
             return s.encode('UTF-8')
         return s
 

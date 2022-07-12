@@ -1,12 +1,10 @@
 import collections
 import copy
 from datetime import datetime, tzinfo, timedelta
-from distutils import version  # pylint: disable=no-name-in-module
+from packaging import version
 import platform
 import random
 import re
-import six
-from six import assertCountEqual, text_type
 import sys
 from tests.diff import diff
 import time
@@ -37,16 +35,12 @@ try:
     from pymongo.read_preferences import ReadPreference
     from pymongo import ReturnDocument
     from pymongo.write_concern import WriteConcern
-
-    _HAVE_PYMONGO = True
 except ImportError:
     from mongomock.collection import ReturnDocument
     from mongomock import ObjectId
     from mongomock.read_concern import ReadConcern
     from mongomock.write_concern import WriteConcern
     from tests.utils import DBRef
-
-    _HAVE_PYMONGO = False
 
 
 warnings.simplefilter('ignore', DeprecationWarning)
@@ -128,60 +122,55 @@ class CollectionAPITest(TestCase):
         self.assertEqual(set(self.db.list_collection_names()), set(['a']))
 
         col = self.db.a
-        r = col.insert({'aa': 'bb'})
-        qr = col.find({'_id': r})
-        self.assertEqual(qr.count(), 1)
+        r = col.insert_one({'aa': 'bb'}).inserted_id
+        self.assertEqual(col.count_documents({'_id': r}), 1)
 
         self.db.drop_collection('a')
-        qr = col.find({'_id': r})
-        self.assertEqual(qr.count(), 0)
+        self.assertEqual(col.count_documents({'_id': r}), 0)
 
         col = self.db.a
-        r = col.insert({'aa': 'bb'})
-        qr = col.find({'_id': r})
-        self.assertEqual(qr.count(), 1)
+        r = col.insert_one({'aa': 'bb'}).inserted_id
+        self.assertEqual(col.count_documents({'_id': r}), 1)
 
         self.assertIsInstance(col._store._documents, collections.OrderedDict)
         self.db.drop_collection(col)
         self.assertIsInstance(col._store._documents, collections.OrderedDict)
-        qr = col.find({'_id': r})
-        self.assertEqual(qr.count(), 0)
+        self.assertEqual(col.count_documents({'_id': r}), 0)
 
     def test__drop_collection_indexes(self):
         col = self.db.a
         col.create_index('simple')
         col.create_index([('value', 1)], unique=True)
-        col.ensure_index([('sparsed', 1)], unique=True, sparse=True)
+        col.create_index([('sparsed', 1)], unique=True, sparse=True)
 
         self.db.drop_collection(col)
 
         # Make sure indexes' rules no longer apply
-        col.insert({'value': 'not_unique_but_ok', 'sparsed': 'not_unique_but_ok'})
-        col.insert({'value': 'not_unique_but_ok'})
-        col.insert({'sparsed': 'not_unique_but_ok'})
-        result = col.find({})
-        self.assertEqual(result.count(), 3)
+        col.insert_one({'value': 'not_unique_but_ok', 'sparsed': 'not_unique_but_ok'})
+        col.insert_one({'value': 'not_unique_but_ok'})
+        col.insert_one({'sparsed': 'not_unique_but_ok'})
+        self.assertEqual(col.count_documents({}), 3)
 
     def test__drop_n_recreate_collection(self):
         col_a = self.db.create_collection('a')
         col_a2 = self.db.a
-        col_a.insert({'foo': 'bar'})
-        self.assertEqual(col_a.find().count(), 1)
-        self.assertEqual(col_a2.find().count(), 1)
-        self.assertEqual(self.db.a.find().count(), 1)
+        col_a.insert_one({'foo': 'bar'})
+        self.assertEqual(col_a.count_documents({}), 1)
+        self.assertEqual(col_a2.count_documents({}), 1)
+        self.assertEqual(self.db.a.count_documents({}), 1)
 
         self.db.drop_collection('a')
-        self.assertEqual(col_a.find().count(), 0)
-        self.assertEqual(col_a2.find().count(), 0)
-        self.assertEqual(self.db.a.find().count(), 0)
+        self.assertEqual(col_a.count_documents({}), 0)
+        self.assertEqual(col_a2.count_documents({}), 0)
+        self.assertEqual(self.db.a.count_documents({}), 0)
 
-        col_a2.insert({'foo2': 'bar2'})
-        self.assertEqual(col_a.find().count(), 1)
-        self.assertEqual(col_a2.find().count(), 1)
-        self.assertEqual(self.db.a.find().count(), 1)
+        col_a2.insert_one({'foo2': 'bar2'})
+        self.assertEqual(col_a.count_documents({}), 1)
+        self.assertEqual(col_a2.count_documents({}), 1)
+        self.assertEqual(self.db.a.count_documents({}), 1)
 
     def test__cursor_hint(self):
-        self.db.collection.insert({'f1': {'f2': 'v'}})
+        self.db.collection.insert_one({'f1': {'f2': 'v'}})
         cursor = self.db.collection.find()
 
         self.assertEqual(cursor, cursor.hint(None))
@@ -193,18 +182,18 @@ class CollectionAPITest(TestCase):
             cursor.hint(None)
 
     def test__distinct_nested_field(self):
-        self.db.collection.insert({'f1': {'f2': 'v'}})
+        self.db.collection.insert_one({'f1': {'f2': 'v'}})
         cursor = self.db.collection.find()
         self.assertEqual(cursor.distinct('f1.f2'), ['v'])
 
     def test__distinct_array_field(self):
-        self.db.collection.insert(
+        self.db.collection.insert_many(
             [{'f1': ['v1', 'v2', 'v1']}, {'f1': ['v2', 'v3']}])
         cursor = self.db.collection.find()
         self.assertEqual(set(cursor.distinct('f1')), set(['v1', 'v2', 'v3']))
 
     def test__distinct_array_nested_field(self):
-        self.db.collection.insert({'f1': [{'f2': 'v'}, {'f2': 'w'}]})
+        self.db.collection.insert_one({'f1': [{'f2': 'v'}, {'f2': 'w'}]})
         cursor = self.db.collection.find()
         self.assertEqual(set(cursor.distinct('f1.f2')), {'v', 'w'})
 
@@ -216,9 +205,18 @@ class CollectionAPITest(TestCase):
         cursor = self.db.collection.find()
         self.assertEqual(cursor.distinct('f1'), [{'f2': 'v2', 'f3': 'v3'}])
 
+    def test__distinct_array_field_with_dicts(self):
+        self.db.collection.insert_many([
+            {'f1': [{'f2': 'v2'}, {'f3': 'v3'}]},
+            {'f1': [{'f3': 'v3'}, {'f4': 'v4'}]},
+        ])
+        cursor = self.db.collection.find()
+        self.assertCountEqual(cursor.distinct('f1'), [{'f2': 'v2'}, {'f3': 'v3'}, {'f4': 'v4'}])
+
     def test__distinct_filter_field(self):
-        self.db.collection.insert([{'f1': 'v1', 'k1': 'v1'}, {'f1': 'v2', 'k1': 'v1'},
-                                   {'f1': 'v3', 'k1': 'v2'}])
+        self.db.collection.insert_many(
+            [{'f1': 'v1', 'k1': 'v1'}, {'f1': 'v2', 'k1': 'v1'},
+             {'f1': 'v3', 'k1': 'v2'}])
         self.assertEqual(set(self.db.collection.distinct('f1', {'k1': 'v1'})), set(['v1', 'v2']))
 
     def test__distinct_error(self):
@@ -226,7 +224,7 @@ class CollectionAPITest(TestCase):
             self.db.collection.distinct({'f1': 1})
 
     def test__cursor_clone(self):
-        self.db.collection.insert([{'a': 'b'}, {'b': 'c'}, {'c': 'd'}])
+        self.db.collection.insert_many([{'a': 'b'}, {'b': 'c'}, {'c': 'd'}])
         cursor1 = self.db.collection.find()
         iterator1 = iter(cursor1)
         first_item = next(iterator1)
@@ -240,7 +238,7 @@ class CollectionAPITest(TestCase):
             next(iterator2)
 
     def test__cursor_clone_keep_limit_skip(self):
-        self.db.collection.insert([{'a': 'b'}, {'b': 'c'}, {'c': 'd'}])
+        self.db.collection.insert_many([{'a': 'b'}, {'b': 'c'}, {'c': 'd'}])
         cursor1 = self.db.collection.find()[1:2]
         cursor2 = cursor1.clone()
         result1 = list(cursor1)
@@ -255,39 +253,51 @@ class CollectionAPITest(TestCase):
 
     def test_cursor_returns_document_copies(self):
         obj = {'a': 1, 'b': 2}
-        self.db.collection.insert(obj)
+        self.db.collection.insert_one(obj)
         fetched_obj = self.db.collection.find_one({'a': 1})
         self.assertEqual(fetched_obj, obj)
         fetched_obj['b'] = 3
         refetched_obj = self.db.collection.find_one({'a': 1})
         self.assertNotEqual(fetched_obj, refetched_obj)
 
+    def test_cursor_with_projection_returns_value_copies(self):
+        self.db.collection.insert_one({'a': ['b']})
+        fetched_list = self.db.collection.find_one(projection=['a'])['a']
+        self.assertEqual(fetched_list, ['b'])
+        fetched_list.append('c')
+        refetched_list = self.db.collection.find_one(projection=['a'])['a']
+        self.assertEqual(refetched_list, ['b'])
+
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'update was removed in pymongo v4')
     def test__update_retval(self):
-        self.db.col.save({'a': 1})
+        self.db.col.insert_one({'a': 1})
         retval = self.db.col.update({'a': 1}, {'b': 2})
         self.assertIsInstance(retval, dict)
-        self.assertIsInstance(retval[text_type('connectionId')], int)
-        self.assertIsNone(retval[text_type('err')])
-        self.assertEqual(retval[text_type('n')], 1)
-        self.assertTrue(retval[text_type('updatedExisting')])
+        self.assertIsInstance(retval['connectionId'], int)
+        self.assertIsNone(retval['err'])
+        self.assertEqual(retval['n'], 1)
+        self.assertTrue(retval['updatedExisting'])
         self.assertEqual(retval['ok'], 1.0)
 
         self.assertEqual(self.db.col.update({'bla': 1}, {'bla': 2})['n'], 0)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'remove was removed in pymongo v4')
     def test__remove_retval(self):
-        self.db.col.save({'a': 1})
+        self.db.col.insert_one({'a': 1})
         retval = self.db.col.remove({'a': 1})
         self.assertIsInstance(retval, dict)
-        self.assertIsInstance(retval[text_type('connectionId')], int)
-        self.assertIsNone(retval[text_type('err')])
-        self.assertEqual(retval[text_type('n')], 1)
-        self.assertEqual(retval[text_type('ok')], 1.0)
+        self.assertIsInstance(retval['connectionId'], int)
+        self.assertIsNone(retval['err'])
+        self.assertEqual(retval['n'], 1)
+        self.assertEqual(retval['ok'], 1.0)
 
         self.assertEqual(self.db.col.remove({'bla': 1})['n'], 0)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'remove was removed in pymongo v4')
     def test__remove_write_concern(self):
         self.db.col.remove({'a': 1}, w=None, wtimeout=None, j=None, fsync=None)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'remove was removed in pymongo v4')
     def test__remove_bad_write_concern(self):
         with self.assertRaises(TypeError):
             self.db.col.remove({'a': 1}, bad_kwarg=1)
@@ -309,7 +319,7 @@ class CollectionAPITest(TestCase):
                 self.save()
 
             def save(self):
-                self.collection.save(self)
+                self.collection.insert_one(self)
 
         doc = Document(self.db.collection)
         self.assertIn('_id', doc)
@@ -322,10 +332,10 @@ class CollectionAPITest(TestCase):
         self.assertIs(col1, self.db.some_collection_here)
         self.assertIsInstance(col1, mongomock.Collection)
 
-    def test__cannot_save_non_string_keys(self):
+    def test__cannot_insert_non_string_keys(self):
         for key in [2, 2.0, True, object()]:
             with self.assertRaises(ValueError):
-                self.db.col1.save({key: 'value'})
+                self.db.col1.insert_one({key: 'value'})
 
     def assert_document_count(self, count=1):
         self.assertEqual(len(self.db.collection._store), count)
@@ -343,6 +353,9 @@ class CollectionAPITest(TestCase):
         self.assertListEqual(
             list(self.db.collection.find(projection=projection)), documents)
 
+    @skipIf(
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'insert was removed in pymongo v4')
     def test__insert(self):
         self.db.collection.insert({'a': 1})
         self.assert_document_count(1)
@@ -447,6 +460,7 @@ class CollectionAPITest(TestCase):
         self.assertEqual(1, error_details['nInserted'])
         self.assertEqual({'a', 'b', 'c'}, {doc['_id'] for doc in self.db.collection.find()})
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'count was removed in pymongo v4')
     def test__count(self):
         self.db.collection.insert_many([
             {'a': 1, 's': 0},
@@ -492,7 +506,7 @@ class CollectionAPITest(TestCase):
         self.assertNotIsInstance(collection.find(), list)
         self.assertNotIsInstance(collection.find(), tuple)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__find_with_collation(self):
         collection = self.db.collection
         collation = Collation('fr')
@@ -520,10 +534,16 @@ class CollectionAPITest(TestCase):
             with self.assertRaises(mongomock.OperationFailure):
                 self.db.collection.find({}, **option)
 
+    @skipIf(
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'find_and_modify was removed in pymongo v4')
     def test__find_and_modify_cannot_remove_and_new(self):
         with self.assertRaises(mongomock.OperationFailure):
             self.db.collection.find_and_modify({}, remove=True, new=True)
 
+    @skipIf(
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'find_and_modify was removed in pymongo v4')
     def test__find_and_modify_cannot_remove_and_update(self):
         with self.assertRaises(ValueError):  # this is also what pymongo raises
             self.db.collection.find_and_modify({'a': 2}, {'a': 3}, remove=True)
@@ -556,6 +576,9 @@ class CollectionAPITest(TestCase):
         self.assertTrue(ret)
         self.assertEqual(7, ret['val'])
 
+    @skipIf(
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'find_and_modify was removed in pymongo v4')
     def test__find_and_modify_no_projection_kwarg(self):
         with self.assertRaises(TypeError):  # unlike pymongo, we warn about this
             self.db.collection.find_and_modify({'a': 2}, {'a': 3}, projection=['a'])
@@ -699,24 +722,21 @@ class CollectionAPITest(TestCase):
         self.db.collection.insert_many(documents)
         self.assert_documents(documents, ignore_ids=False)
 
-        cursor = self.db.collection.find({'x': 1})
-        self.assertEqual(cursor.count(), 4)
+        self.assertEqual(self.db.collection.count_documents({'x': 1}), 4)
 
         # Update the field used by the cursor's filter should not upset the iteration
-        for doc in cursor:
+        for doc in self.db.collection.find({'x': 1}):
             self.db.collection.update_one({'_id': doc['_id']}, {'$set': {'x': 2}})
 
-        cursor = self.db.collection.find({'x': 1})
-        self.assertEqual(cursor.count(), 0)
-        cursor = self.db.collection.find({'x': 2})
-        self.assertEqual(cursor.count(), 4)
+        self.assertEqual(self.db.collection.count_documents({'x': 1}), 0)
+        self.assertEqual(self.db.collection.count_documents({'x': 2}), 4)
 
     def test__update_interns_lists_and_dicts(self):
         obj = {}
-        obj_id = self.db.collection.save(obj)
+        obj_id = self.db.collection.insert_one(obj).inserted_id
         external_dict = {}
         external_list = []
-        self.db.collection.update({'_id': obj_id}, {'d': external_dict, 'l': external_list})
+        self.db.collection.replace_one({'_id': obj_id}, {'d': external_dict, 'l': external_list})
         external_dict['a'] = 'b'
         external_list.append(1)
         self.assertEqual(
@@ -724,12 +744,12 @@ class CollectionAPITest(TestCase):
             [{'_id': obj_id, 'd': {}, 'l': []}])
 
     def test__update_cannot_change__id(self):
-        self.db.collection.insert({'_id': 1, 'a': 1})
+        self.db.collection.insert_one({'_id': 1, 'a': 1})
         with self.assertRaises(mongomock.OperationFailure):
-            self.db.collection.update({'_id': 1}, {'_id': 2, 'b': 2})
+            self.db.collection.replace_one({'_id': 1}, {'_id': 2, 'b': 2})
 
     def test__update_empty_id(self):
-        self.db.collection.save({'_id': '', 'a': 1})
+        self.db.collection.insert_one({'_id': '', 'a': 1})
         self.db.collection.replace_one({'_id': ''}, {'b': 1})
         doc = self.db.collection.find_one({'_id': ''})
         self.assertEqual(1, doc['b'])
@@ -906,6 +926,42 @@ class CollectionAPITest(TestCase):
                 collation='fr',
             )
 
+    def test__update_many_array_filters(self):
+        self.db.collection.insert_many([
+            {'a': 1, 'c': [2, 5, 6]},
+            {'a': 1, 'c': [3, 4, 5]},
+            {'a': 2, 'c': [12, 15]}
+        ])
+        self.db.collection.update_many(
+            filter={'a': 1},
+            update={'$set': {'a': 0}},
+            array_filters=None,
+        )
+        with self.assertRaises(NotImplementedError):
+            self.db.collection.update_many(
+                filter={'a': 1},
+                update={'$set': {'c.$[e]': 0}},
+                array_filters=[{'e': {'$lt': 5}}],
+            )
+
+    def test__update_many_let(self):
+        self.db.collection.insert_many([
+            {'a': 1, 'c': 2},
+            {'a': 1, 'c': 3},
+            {'a': 2, 'c': 4}
+        ])
+        self.db.collection.update_many(
+            filter={'a': 1},
+            update={'$set': {'c': '$$newValue'}},
+            let=None,
+        )
+        with self.assertRaises(NotImplementedError):
+            self.db.collection.update_many(
+                filter={'a': 1},
+                update={'$set': {'c': '$$newValue'}},
+                let={'newValue': 0},
+            )
+
     def test__update_many_upsert(self):
         self.assert_document_count(0)
         update_result = self.db.collection.update_many(
@@ -1070,31 +1126,31 @@ class CollectionAPITest(TestCase):
         }}, self.db.collection.find_one({}, {'_id': 0}))
 
     def test__update_pop(self):
-        self.db.collection.insert({'name': 'bob', 'hat': ['green', 'tall']})
+        self.db.collection.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
         self.db.collection.update_one({'name': 'bob'}, {'$pop': {'hat': 1}})
         res = self.db.collection.find_one({'name': 'bob'})
         self.assertEqual(['green'], res['hat'])
 
     def test__update_pop_negative_index(self):
-        self.db.collection.insert({'name': 'bob', 'hat': ['green', 'tall']})
+        self.db.collection.insert_one({'name': 'bob', 'hat': ['green', 'tall']})
         self.db.collection.update_one({'name': 'bob'}, {'$pop': {'hat': -1}})
         res = self.db.collection.find_one({'name': 'bob'})
         self.assertEqual(['tall'], res['hat'])
 
     def test__update_pop_large_index(self):
-        self.db.collection.insert({'name': 'bob', 'hat': [['green', 'tall']]})
+        self.db.collection.insert_one({'name': 'bob', 'hat': [['green', 'tall']]})
         self.db.collection.update_one({'name': 'bob'}, {'$pop': {'hat.1': 1}})
         res = self.db.collection.find_one({'name': 'bob'})
         self.assertEqual([['green', 'tall']], res['hat'])
 
     def test__update_pop_empty(self):
-        self.db.collection.insert({'name': 'bob', 'hat': []})
+        self.db.collection.insert_one({'name': 'bob', 'hat': []})
         self.db.collection.update_one({'name': 'bob'}, {'$pop': {'hat': 1}})
         res = self.db.collection.find_one({'name': 'bob'})
         self.assertEqual([], res['hat'])
 
     def test__replace_one(self):
-        self.db.collection.insert({'a': 1, 'b': 2})
+        self.db.collection.insert_one({'a': 1, 'b': 2})
         self.assert_documents([{'a': 1, 'b': 2}])
 
         result = self.db.collection.replace_one(
@@ -1180,21 +1236,20 @@ class CollectionAPITest(TestCase):
 
     def test__string_matching(self):
         """Make sure strings are not treated as collections on find"""
-        self.db['abc'].save({'name': 'test1'})
-        self.db['abc'].save({'name': 'test2'})
+        self.db['abc'].insert_one({'name': 'test1'})
+        self.db['abc'].insert_one({'name': 'test2'})
         # now searching for 'name':'e' returns test1
         self.assertIsNone(self.db['abc'].find_one({'name': 'e'}))
 
     def test__collection_is_indexable(self):
-        self.db['def'].save({'name': 'test1'})
-        self.assertTrue(self.db['def'].find({'name': 'test1'}).count() > 0)
+        self.db['def'].insert_one({'name': 'test1'})
         self.assertEqual(self.db['def'].find({'name': 'test1'})[0]['name'], 'test1')
 
     def test__cursor_distinct(self):
         larry_bob = {'name': 'larry'}
         larry = {'name': 'larry'}
         gary = {'name': 'gary'}
-        self.db['coll_name'].insert([larry_bob, larry, gary])
+        self.db['coll_name'].insert_many([larry_bob, larry, gary])
         ret_val = self.db['coll_name'].find().distinct('name')
         self.assertIsInstance(ret_val, list)
         self.assertTrue(set(ret_val) == set(['larry', 'gary']))
@@ -1211,11 +1266,12 @@ class CollectionAPITest(TestCase):
         first_ones = list(cursor)
         self.assertEqual(30, len(first_ones))
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'count was removed in pymongo v4')
     def test__cursor_count_with_limit(self):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         count = self.db['coll_name'].find().limit(
             2).count(with_limit_and_skip=True)
         self.assertEqual(count, 2)
@@ -1223,33 +1279,36 @@ class CollectionAPITest(TestCase):
             0).count(with_limit_and_skip=True)
         self.assertEqual(count, 3)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'count was removed in pymongo v4')
     def test__cursor_count_with_skip(self):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         count = self.db['coll_name'].find().skip(
             1).count(with_limit_and_skip=True)
         self.assertEqual(count, 2)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'count was removed in pymongo v4')
     def test__cursor_count_with_skip_init(self):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         count = self.db['coll_name'].find(skip=1).count(with_limit_and_skip=True)
         self.assertEqual(count, 2)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'count was removed in pymongo v4')
     def test__cursor_count_when_db_changes(self):
-        self.db['coll_name'].insert({})
+        self.db['coll_name'].insert_one({})
         cursor = self.db['coll_name'].find()
-        self.db['coll_name'].insert({})
+        self.db['coll_name'].insert_one({})
         self.assertEqual(cursor.count(), 2)
 
     def test__cursor_getitem_when_db_changes(self):
-        self.db['coll_name'].insert({})
+        self.db['coll_name'].insert_one({})
         cursor = self.db['coll_name'].find()
-        self.db['coll_name'].insert({})
+        self.db['coll_name'].insert_one({})
         cursor_items = [x for x in cursor]
         self.assertEqual(len(cursor_items), 2)
 
@@ -1257,7 +1316,7 @@ class CollectionAPITest(TestCase):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         cursor = self.db['coll_name'].find()
         item = cursor[0]
         self.assertEqual(item['name'], 'first')
@@ -1266,20 +1325,18 @@ class CollectionAPITest(TestCase):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         cursor = self.db['coll_name'].find()
         ret = cursor[1:4]
         self.assertIs(ret, cursor)
-        count = cursor.count()
-        self.assertEqual(count, 3)
-        count = cursor.count(with_limit_and_skip=True)
+        count = sum(1 for d in cursor)
         self.assertEqual(count, 2)
 
     def test__cursor_getitem_negative_index(self):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         cursor = self.db['coll_name'].find()
         with self.assertRaises(IndexError):
             cursor[-1]  # pylint: disable=pointless-statement
@@ -1288,7 +1345,7 @@ class CollectionAPITest(TestCase):
         first = {'name': 'first'}
         second = {'name': 'second'}
         third = {'name': 'third'}
-        self.db['coll_name'].insert([first, second, third])
+        self.db['coll_name'].insert_many([first, second, third])
         cursor = self.db['coll_name'].find()
         with self.assertRaises(TypeError):
             cursor['not_a_number']  # pylint: disable=pointless-statement
@@ -1298,11 +1355,9 @@ class CollectionAPITest(TestCase):
 
         u1 = {'name': 'first'}
         u2 = {'name': 'second'}
-        self.db['users'].insert([u1, u2])
-        self.assertEqual(
-            self.db['users'].find(
-                sort=[
-                    ('name', 1)], skip=1).count(with_limit_and_skip=True), 1)
+        self.db['users'].insert_many([u1, u2])
+        count = sum(1 for d in self.db['users'].find(sort=[('name', 1)], skip=1))
+        self.assertEqual(1, count)
         self.assertEqual(
             self.db['users'].find(
                 sort=[
@@ -1318,7 +1373,7 @@ class CollectionAPITest(TestCase):
         values = list(range(20))
         random.shuffle(values)
         for val in values:
-            self.db.collection.insert({'_id': val})
+            self.db.collection.insert_one({'_id': val})
 
         find_cursor = self.db.collection.find()
 
@@ -1327,34 +1382,34 @@ class CollectionAPITest(TestCase):
             expected = {'_id': val}
             self.assertEqual(in_db_val, expected)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_uniq_idxs_with_ascending_ordering(self):
         self.db.collection.create_index([('value', pymongo.ASCENDING)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1})
+            self.db.collection.insert_one({'value': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_uniq_idxs_with_descending_ordering(self):
         self.db.collection.create_index([('value', pymongo.DESCENDING)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1})
+            self.db.collection.insert_one({'value': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__create_uniq_idxs_without_ordering(self):
         self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1})
+            self.db.collection.insert_one({'value': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__create_index_duplicate(self):
         self.db.collection.create_index([('value', 1)])
@@ -1371,37 +1426,37 @@ class CollectionAPITest(TestCase):
     def test__ttl_index_ignores_record_in_the_future(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'value': datetime.utcnow() + timedelta(seconds=100)})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_index_ignores_records_with_non_datetime_values(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'value': 'not a dt'})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_index_record_expiry(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=5)
         self.db.collection.insert_one({'value': datetime.utcnow() - timedelta(seconds=5)})
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
     def test__ttl_expiration_of_0(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
     def test__ttl_with_non_integer_value_is_ignored(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds='a')
         self.db.collection.insert_one({'value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_applied_to_compound_key_is_ignored(self):
         self.db.collection.create_index([('field1', 1), ('field2', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'field1': datetime.utcnow(), 'field2': 'val2'})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_ignored_when_document_does_not_contain_indexed_field(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'other_value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_of_array_field_expiration(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=5)
@@ -1412,7 +1467,7 @@ class CollectionAPITest(TestCase):
                 datetime.utcnow() + timedelta(seconds=100)
             ]
         })
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
         self.db.collection.drop()
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=5)
@@ -1424,50 +1479,50 @@ class CollectionAPITest(TestCase):
                 datetime.utcnow() + timedelta(seconds=100)
             ]
         })
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
     def test__ttl_of_array_field_without_datetime_does_not_expire(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=5)
         self.db.collection.insert_one({'value': ['a', 'b', 'c', 1, 2, 3]})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     @skipIf(not _HAVE_MOCK, 'mock not installed')
     def test__ttl_expiry_with_mock(self):
         now = datetime.utcnow()
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=100)
         self.db.collection.insert_one({'value': now + timedelta(seconds=100)})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
         with mock.patch('mongomock.utcnow') as mongomock_utcnow:
             mongomock_utcnow.return_value = now + timedelta(100)
-            self.assertEqual(self.db.collection.find({}).count(), 0)
+            self.assertEqual(self.db.collection.count_documents({}), 0)
 
     def test__ttl_index_is_removed_if_collection_dropped(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
         self.db.collection.drop()
         self.db.collection.insert_one({'value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_index_is_removed_when_index_is_dropped(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
         self.db.collection.drop_index('value_1')
         self.db.collection.insert_one({'value': datetime.utcnow()})
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ttl_index_removes_expired_documents_prior_to_removal(self):
         self.db.collection.create_index([('value', 1)], expireAfterSeconds=0)
         self.db.collection.insert_one({'value': datetime.utcnow()})
 
         self.db.collection.drop_index('value_1')
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_indexes_with_expireAfterSeconds(self):
         indexes = [
             pymongo.operations.IndexModel([('value', pymongo.ASCENDING)], expireAfterSeconds=5),
@@ -1476,14 +1531,14 @@ class CollectionAPITest(TestCase):
         self.assertEqual(1, len(index_names))
 
         self.db.collection.insert_one({'value': datetime.utcnow() - timedelta(seconds=5)})
-        self.assertEqual(self.db.collection.find({}).count(), 0)
+        self.assertEqual(self.db.collection.count_documents({}), 0)
 
     def test__create_indexes_wrong_type(self):
         indexes = [('value', 1), ('name', 1)]
         with self.assertRaises(TypeError):
             self.db.collection.create_indexes(indexes)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_indexes_uniq_idxs(self):
         indexes = [
             pymongo.operations.IndexModel([('value', pymongo.ASCENDING)], unique=True),
@@ -1492,16 +1547,16 @@ class CollectionAPITest(TestCase):
         index_names = self.db.collection.create_indexes(indexes)
         self.assertEqual(2, len(index_names))
 
-        self.db.collection.insert({'value': 1, 'name': 'bob'})
+        self.db.collection.insert_one({'value': 1, 'name': 'bob'})
         # Ensure both uniq indexes have been created
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1, 'name': 'different'})
+            self.db.collection.insert_one({'value': 1, 'name': 'different'})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 0, 'name': 'bob'})
+            self.db.collection.insert_one({'value': 0, 'name': 'bob'})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_indexes_names(self):
         indexes = [
             pymongo.operations.IndexModel([('value', pymongo.ASCENDING)], name='index_name'),
@@ -1510,161 +1565,184 @@ class CollectionAPITest(TestCase):
         index_names = self.db.collection.create_indexes(indexes)
         self.assertEqual(['index_name', 'name_1'], index_names)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__ensure_uniq_idxs_with_ascending_ordering(self):
-        self.db.collection.ensure_index([('value', pymongo.ASCENDING)], unique=True)
+        self.db.collection.create_index([('value', pymongo.ASCENDING)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1})
+            self.db.collection.insert_one({'value': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__ensure_uniq_idxs_with_descending_ordering(self):
-        self.db.collection.ensure_index([('value', pymongo.DESCENDING)], unique=True)
+        self.db.collection.create_index([('value', pymongo.DESCENDING)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1})
+            self.db.collection.insert_one({'value': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__ensure_uniq_idxs_on_nested_field(self):
-        self.db.collection.ensure_index([('a.b', 1)], unique=True)
+        self.db.collection.create_index([('a.b', 1)], unique=True)
 
-        self.db.collection.insert({'a': 1})
-        self.db.collection.insert({'a': {'b': 1}})
+        self.db.collection.insert_one({'a': 1})
+        self.db.collection.insert_one({'a': {'b': 1}})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'a': {'b': 1}})
+            self.db.collection.insert_one({'a': {'b': 1}})
 
-        self.assertEqual(self.db.collection.find({}).count(), 2)
+        self.assertEqual(self.db.collection.count_documents({}), 2)
 
     def test__ensure_sparse_uniq_idxs_on_nested_field(self):
-        self.db.collection.ensure_index([('a.b', 1)], unique=True, sparse=True)
-        self.db.collection.ensure_index([('c', 1)], unique=True, sparse=True)
+        self.db.collection.create_index([('a.b', 1)], unique=True, sparse=True)
+        self.db.collection.create_index([('c', 1)], unique=True, sparse=True)
 
-        self.db.collection.insert({})
-        self.db.collection.insert({})
-        self.db.collection.insert({'c': 1})
-        self.db.collection.insert({'a': 1})
-        self.db.collection.insert({'a': {'b': 1}})
+        self.db.collection.insert_one({})
+        self.db.collection.insert_one({})
+        self.db.collection.insert_one({'c': 1})
+        self.db.collection.insert_one({'a': 1})
+        self.db.collection.insert_one({'a': {'b': 1}})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'a': {'b': 1}})
+            self.db.collection.insert_one({'a': {'b': 1}})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'c': 1})
+            self.db.collection.insert_one({'c': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 5)
+        self.assertEqual(self.db.collection.count_documents({}), 5)
+
+    def test__ensure_partial_filter_expression_unique_index(self):
+        self.db.collection.delete_many({})
+        self.db.collection.create_index(
+            (('partialFilterExpression_value', 1), ('value', 1)),
+            unique=True, partialFilterExpression={'partialFilterExpression_value': {'$eq': 1}})
+
+        # We should be able to add documents with duplicated `value` and
+        # `partialFilterExpression_value` if `partialFilterExpression_value` isn't set to 1
+        self.db.collection.insert_one({'partialFilterExpression_value': 3, 'value': 4})
+        self.db.collection.insert_one({'partialFilterExpression_value': 3, 'value': 4})
+
+        # We should be able to add documents with distinct `value` values and duplicated
+        # `partialFilterExpression_value` value set to 1.
+        self.db.collection.insert_one({'partialFilterExpression_value': 1, 'value': 2})
+        self.db.collection.insert_one({'partialFilterExpression_value': 1, 'value': 3})
+
+        # We should not be able to add documents with duplicated `partialFilterExpression_value` and
+        # `value` values if `partialFilterExpression_value` is 1.
+        with self.assertRaises(mongomock.DuplicateKeyError):
+            self.db.collection.insert_one({'partialFilterExpression_value': 1, 'value': 3})
+
+        self.assertEqual(self.db.collection.count_documents({}), 4)
 
     def test__ensure_uniq_idxs_without_ordering(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True)
+        self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 1})
+            self.db.collection.insert_one({'value': 1})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__insert_empty_doc_uniq_idx(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True)
+        self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.insert({'value': 1})
-        self.db.collection.insert({})
+        self.db.collection.insert_one({'value': 1})
+        self.db.collection.insert_one({})
 
-        self.assertEqual(self.db.collection.find({}).count(), 2)
+        self.assertEqual(self.db.collection.count_documents({}), 2)
 
     def test__insert_empty_doc_twice_uniq_idx(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True)
+        self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.insert({})
+        self.db.collection.insert_one({})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({})
+            self.db.collection.insert_one({})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test_sparse_unique_index(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True, sparse=True)
+        self.db.collection.create_index([('value', 1)], unique=True, sparse=True)
 
-        self.db.collection.insert({})
-        self.db.collection.insert({})
-        self.db.collection.insert({'value': None})
-        self.db.collection.insert({'value': None})
+        self.db.collection.insert_one({})
+        self.db.collection.insert_one({})
+        self.db.collection.insert_one({'value': None})
+        self.db.collection.insert_one({'value': None})
 
-        self.assertEqual(self.db.collection.find({}).count(), 4)
+        self.assertEqual(self.db.collection.count_documents({}), 4)
 
     def test_unique_index_with_upsert_insertion(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True)
+        self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.save({'_id': 1, 'value': 1})
+        self.db.collection.insert_one({'_id': 1, 'value': 1})
         # Updating document should not trigger error
-        self.db.collection.save({'_id': 1, 'value': 1})
-        self.db.collection.update({'value': 1}, {'value': 1}, upsert=True)
+        self.db.collection.replace_one({'_id': 1}, {'value': 1})
+        self.db.collection.replace_one({'value': 1}, {'value': 1}, upsert=True)
         # Creating new documents with same value should
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.save({'value': 1})
+            self.db.collection.insert_one({'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.update({'bad': 'condition'}, {'value': 1}, upsert=True)
+            self.db.collection.replace_one({'bad': 'condition'}, {'value': 1}, upsert=True)
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.save({'_id': 2, 'value': 1})
+            self.db.collection.insert_one({'_id': 2, 'value': 1})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.update({'_id': 2}, {'$set': {'value': 1}}, upsert=True)
+            self.db.collection.update_one({'_id': 2}, {'$set': {'value': 1}}, upsert=True)
 
     def test_unique_index_with_update(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True)
+        self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.save({'_id': 1, 'value': 1})
-        self.db.collection.save({'_id': 2, 'value': 2})
+        self.db.collection.insert_one({'_id': 1, 'value': 1})
+        self.db.collection.insert_one({'_id': 2, 'value': 2})
 
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.update({'value': 1}, {'value': 2})
+            self.db.collection.replace_one({'value': 1}, {'value': 2})
 
     def test_unique_index_with_update_on_nested_field(self):
-        self.db.collection.ensure_index([('a.b', 1)], unique=True)
+        self.db.collection.create_index([('a.b', 1)], unique=True)
 
-        self.db.collection.save({'_id': 1, 'a': {'b': 1}})
-        self.db.collection.save({'_id': 2, 'a': {'b': 2}})
+        self.db.collection.insert_one({'_id': 1, 'a': {'b': 1}})
+        self.db.collection.insert_one({'_id': 2, 'a': {'b': 2}})
 
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.update({'_id': 1}, {'$set': {'a.b': 2}})
+            self.db.collection.update_one({'_id': 1}, {'$set': {'a.b': 2}})
 
     def test_unique_index_on_dict(self):
         self.db.collection.insert_one({'_id': 1, 'a': {'b': 1}})
         self.db.collection.insert_one({'_id': 2, 'a': {'b': 2}})
 
-        self.db.collection.ensure_index([('a', 1)], unique=True)
+        self.db.collection.create_index([('a', 1)], unique=True)
 
         self.db.collection.insert_one({'_id': 3, 'a': {'b': 3}})
         with self.assertRaises(mongomock.DuplicateKeyError):
             self.db.collection.insert_one({'_id': 4, 'a': {'b': 2}})
 
     def test_sparse_unique_index_dup(self):
-        self.db.collection.ensure_index([('value', 1)], unique=True, sparse=True)
+        self.db.collection.create_index([('value', 1)], unique=True, sparse=True)
 
-        self.db.collection.insert({'value': 'a'})
+        self.db.collection.insert_one({'value': 'a'})
         with self.assertRaises(mongomock.DuplicateKeyError):
-            self.db.collection.insert({'value': 'a'})
+            self.db.collection.insert_one({'value': 'a'})
 
-        self.assertEqual(self.db.collection.find({}).count(), 1)
+        self.assertEqual(self.db.collection.count_documents({}), 1)
 
     def test__create_uniq_idxs_with_dupes_already_there(self):
-        self.db.collection.insert({'value': 1})
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
+        self.db.collection.insert_one({'value': 1})
 
         with self.assertRaises(mongomock.DuplicateKeyError):
             self.db.collection.create_index([('value', 1)], unique=True)
 
-        self.db.collection.insert({'value': 1})
-        self.assertEqual(self.db.collection.find({}).count(), 3)
+        self.db.collection.insert_one({'value': 1})
+        self.assertEqual(self.db.collection.count_documents({}), 3)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_index_with_name(self):
         name = self.db.collection.create_index([('value', 1)], name='index_name')
         self.assertEqual('index_name', name)
-        self.db.collection.ensure_index([('value', 1)], name='index_name')
+        self.db.collection.create_index([('value', 1)], name='index_name')
         self.assertEqual({'_id_', 'index_name'}, set(self.db.collection.index_information().keys()))
 
     def test__insert_empty_doc_idx_information(self):
-        self.db.collection.insert({})
+        self.db.collection.insert_one({})
 
         index_information = self.db.collection.index_information()
         self.assertEqual(
@@ -1692,7 +1770,7 @@ class CollectionAPITest(TestCase):
     def test__create_idx_information(self):
         index = self.db.collection.create_index([('value', 1)])
 
-        self.db.collection.insert({})
+        self.db.collection.insert_one({})
 
         self.assertDictEqual(
             {
@@ -1709,11 +1787,11 @@ class CollectionAPITest(TestCase):
         with self.assertRaises(mongomock.OperationFailure):
             self.db.collection.drop_index('unknownIndex')
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_unique_idx_information_with_ascending_ordering(self):
         index = self.db.collection.create_index([('value', pymongo.ASCENDING)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
 
         self.assertDictEqual(
             {
@@ -1723,11 +1801,11 @@ class CollectionAPITest(TestCase):
             },
             self.db.collection.index_information()[index])
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__create_unique_idx_information_with_descending_ordering(self):
         index = self.db.collection.create_index([('value', pymongo.DESCENDING)], unique=True)
 
-        self.db.collection.insert({'value': 1})
+        self.db.collection.insert_one({'value': 1})
 
         self.assertDictEqual(
             self.db.collection.index_information()[index],
@@ -1744,19 +1822,22 @@ class CollectionAPITest(TestCase):
                                         {'str_field': 'b'},
                                         {'str_field': 'c'}]}
 
-        self.db.collection.insert(base_document)
-        self.db.collection.update({'int_field': 1, 'list_field.str_field': 'b'},
-                                  {'$set': {'list_field.$.marker': True}})
+        self.db.collection.insert_one(base_document)
+        self.db.collection.update_one(
+            {'int_field': 1, 'list_field.str_field': 'b'},
+            {'$set': {'list_field.$.marker': True}})
 
         expected_document = copy.deepcopy(base_document)
         expected_document['list_field'][1]['marker'] = True
         self.assertEqual(list(self.db.collection.find()), [expected_document])
 
-        self.db.collection.update({'int_field': 1, 'list_field.str_field': 'a'},
-                                  {'$set': {'list_field.$.marker': True}})
+        self.db.collection.update_one(
+            {'int_field': 1, 'list_field.str_field': 'a'},
+            {'$set': {'list_field.$.marker': True}})
 
-        self.db.collection.update({'int_field': 1, 'list_field.str_field': 'c'},
-                                  {'$set': {'list_field.$.marker': True}})
+        self.db.collection.update_one(
+            {'int_field': 1, 'list_field.str_field': 'c'},
+            {'$set': {'list_field.$.marker': True}})
 
         expected_document['list_field'][0]['marker'] = True
         expected_document['list_field'][2]['marker'] = True
@@ -1771,12 +1852,12 @@ class CollectionAPITest(TestCase):
                 {'str_field': 'c'}
             ]}
         new_subdoc = {'str_field': 'x'}
-        self.db.collection.insert(base_document)
-        self.db.collection.update(
+        self.db.collection.insert_one(base_document)
+        self.db.collection.update_one(
             {'int_field': 1},
             {'$set': {'list_field.1': new_subdoc}})
 
-        self.db.collection.update(
+        self.db.collection.update_one(
             {'int_field': 1, 'list_field.2.str_field': 'c'},
             {'$set': {'list_field.2': new_subdoc}})
 
@@ -1795,8 +1876,8 @@ class CollectionAPITest(TestCase):
                 {'str_field': 'c'}
             ]}
         new_subdoc = {'str_field': 'x'}
-        self.db.collection.insert(base_document)
-        self.db.collection.update(
+        self.db.collection.insert_one(base_document)
+        self.db.collection.update_one(
             {'int_field': 1, 'list_field.str_field': 'b'},
             {'$set': {'list_field.$': new_subdoc}})
 
@@ -1805,42 +1886,42 @@ class CollectionAPITest(TestCase):
 
         self.assertEqual(list(self.db.collection.find()), [expected_document])
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'find_and_modify was removed in pymongo v4')
     def test__find_and_modify_with_sort(self):
-        clock_iter = iter(range(1, 10))
-        self.db.collection.insert_one({'time_check': float(time.time() + next(clock_iter))})
-        self.db.collection.insert_one({'time_check': float(time.time() + next(clock_iter))})
-        self.db.collection.insert_one({'time_check': float(time.time() + next(clock_iter))})
+        self.db.collection.insert_one({'time_check': float(time.time())})
+        self.db.collection.insert_one({'time_check': float(time.time())})
+        self.db.collection.insert_one({'time_check': float(time.time())})
 
-        start_check_time = float(time.time() + next(clock_iter))
-        a = self.db.collection.find(
-            {'time_check': {'$lt': start_check_time}})
+        start_check_time = float(time.time())
         self.db.collection.find_and_modify(
             {'time_check': {'$lt': start_check_time}},
-            {'$set': {'time_check': float(time.time() + next(clock_iter)), 'checked': True}},
+            {'$set': {'time_check': float(time.time()), 'checked': True}},
             sort=[('time_check', pymongo.ASCENDING)])
         sorted_records = sorted(list(self.db.collection.find()), key=lambda x: x['time_check'])
         self.assertEqual(sorted_records[-1]['checked'], True)
 
         self.db.collection.find_and_modify(
             {'time_check': {'$lt': start_check_time}},
-            {'$set': {'time_check': float(time.time() + next(clock_iter)), 'checked': True}},
+            {'$set': {'time_check': float(time.time()), 'checked': True}},
             sort=[('time_check', pymongo.ASCENDING)])
 
         self.db.collection.find_and_modify(
             {'time_check': {'$lt': start_check_time}},
-            {'$set': {'time_check': float(time.time() + next(clock_iter)), 'checked': True}},
+            {'$set': {'time_check': float(time.time()), 'checked': True}},
             sort=[('time_check', pymongo.ASCENDING)])
 
         expected = list(filter(lambda x: 'checked' in x, list(self.db.collection.find())))
-        self.assertEqual(self.db.collection.find().count(), len(expected))
+        self.assertEqual(self.db.collection.count_documents({}), len(expected))
         self.assertEqual(
             list(self.db.collection.find({'checked': True})), list(self.db.collection.find()))
 
     def test__cursor_sort_kept_after_clone(self):
-        self.db.collection.insert({'time_check': float(time.time())})
-        self.db.collection.insert({'time_check': float(time.time())})
-        self.db.collection.insert({'time_check': float(time.time())})
+        self.db.collection.insert_one({'time_check': float(time.time())})
+        self.db.collection.insert_one({'time_check': float(time.time())})
+        self.db.collection.insert_one({'time_check': float(time.time())})
 
         cursor = self.db.collection.find({}, sort=[('time_check', -1)])
         cursor2 = cursor.clone()
@@ -1856,6 +1937,9 @@ class CollectionAPITest(TestCase):
         self.assertEqual(cursor4_result, cursor_result)
 
     @skipIf(sys.version_info < (3, 7), 'Older versions of Python cannot copy regex partterns')
+    @skipIf(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'pymongo v4 or above do not specify uuid encoding')
     def test__sort_mixed_types(self):
         self.db.collection.insert_many([
             {'type': 'bool', 'a': True},
@@ -1891,6 +1975,9 @@ class CollectionAPITest(TestCase):
             'regex',
         ], [doc['type'] for doc in cursor])
 
+    @skipIf(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'pymongo v4 or above do not specify uuid encoding')
     def test__sort_by_uuid(self):
         self.db.collection.insert_many([
             {'_id': uuid.UUID(int=3), 'timestamp': 99, 'a': 1},
@@ -1902,10 +1989,10 @@ class CollectionAPITest(TestCase):
 
     def test__avoid_change_data_after_set(self):
         test_data = {'test': ['test_data']}
-        self.db.collection.insert({'_id': 1})
-        self.db.collection.update({'_id': 1}, {'$set': test_data})
+        self.db.collection.insert_one({'_id': 1})
+        self.db.collection.update_one({'_id': 1}, {'$set': test_data})
 
-        self.db.collection.update(
+        self.db.collection.update_one(
             {'_id': 1}, {'$addToSet': {'test': 'another_one'}})
         data_in_db = self.db.collection.find_one({'_id': 1})
         self.assertNotEqual(data_in_db['test'], test_data['test'])
@@ -1913,7 +2000,7 @@ class CollectionAPITest(TestCase):
         self.assertEqual(len(data_in_db['test']), 2)
 
     def test__filter_with_ne(self):
-        self.db.collection.insert({'_id': 1, 'test_list': [{'data': 'val'}]})
+        self.db.collection.insert_one({'_id': 1, 'test_list': [{'data': 'val'}]})
         data_in_db = self.db.collection.find(
             {'test_list.marker_field': {'$ne': True}})
         self.assertEqual(
@@ -1965,13 +2052,13 @@ class CollectionAPITest(TestCase):
             self.db.collection.find({}, max_time_ms='1000')
 
     def test__find_and_project_3_level_deep_nested_field(self):
-        self.db.collection.insert({'_id': 1, 'a': {'b': {'c': 2}}})
+        self.db.collection.insert_one({'_id': 1, 'a': {'b': {'c': 2}}})
         data_in_db = self.db.collection.find(projection=['a.b.c'])
         self.assertEqual(
             list(data_in_db), [{'_id': 1, 'a': {'b': {'c': 2}}}])
 
     def test__find_and_project_wrong_types(self):
-        self.db.collection.insert({'_id': 1, 'a': {'b': {'c': 2}}})
+        self.db.collection.insert_one({'_id': 1, 'a': {'b': {'c': 2}}})
         with self.assertRaises(TypeError):
             self.db.collection.find_one({}, projection=[{'a': {'b': {'c': 1}}}])
 
@@ -2015,7 +2102,7 @@ class CollectionAPITest(TestCase):
                 {'a': 1}, collections.OrderedDict([('_id', 0), ('a', 0), ('b.c', 0), ('b', 0)]))
 
     def test__find_and_project(self):
-        self.db.collection.insert({'_id': 1, 'a': 42, 'b': 'other', 'c': {'d': 'nested'}})
+        self.db.collection.insert_one({'_id': 1, 'a': 42, 'b': 'other', 'c': {'d': 'nested'}})
 
         self.assertEqual(
             [{'_id': 1, 'a': 42}],
@@ -2038,7 +2125,7 @@ class CollectionAPITest(TestCase):
             list(self.db.collection.find({}, projection={'a': False})))
 
     def test__find_and_project_positional(self):
-        self.db.collection.insert({'_id': 1, 'a': [{'b': 1}, {'b': 2}]})
+        self.db.collection.insert_one({'_id': 1, 'a': [{'b': 1}, {'b': 2}]})
 
         with self.assertRaises(mongomock.OperationFailure):
             self.db.collection.find_one({'a.b': {'$exists': True}}, projection={'a.$.b': 0})
@@ -2090,7 +2177,7 @@ class CollectionAPITest(TestCase):
         self.assertNotEqual(self.db.collection.read_concern, col2.read_concern)
         self.assertEqual({'level': 'majority'}, col2.read_concern.document)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__with_options_different_read_preference(self):
         self.db.collection.insert_one({'name': 'col1'})
         col2 = self.db.collection.with_options(read_preference=ReadPreference.NEAREST)
@@ -2105,7 +2192,7 @@ class CollectionAPITest(TestCase):
         self.assertNotEqual(self.db.collection.read_preference, col2.read_preference)
         self.assertEqual('nearest', col2.read_preference.mongos_mode)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__codec_options(self):
         self.assertEqual(codec_options.CodecOptions(), self.db.collection.codec_options)
         self.db.collection.with_options(codec_options.CodecOptions())
@@ -2136,7 +2223,8 @@ class CollectionAPITest(TestCase):
     def test_datetime_precision(self):
         too_precise_dt = datetime(2000, 1, 1, 12, 30, 30, 123456)
         mongo_dt = datetime(2000, 1, 1, 12, 30, 30, 123000)
-        objid = self.db.collection.insert({'date_too_precise': too_precise_dt, 'date': mongo_dt})
+        objid = self.db.collection.insert_one(
+            {'date_too_precise': too_precise_dt, 'date': mongo_dt}).inserted_id
         self.assert_document_count(1)
         # Given both date are equivalent, we can mix them
         self.db.collection.update_one(
@@ -2162,7 +2250,7 @@ class CollectionAPITest(TestCase):
         utc2tz = UTCPlus2()
         naive = datetime(1999, 12, 31, 22)
         aware = datetime(2000, 1, 1, tzinfo=utc2tz)
-        self.db.collection.insert({'date_aware': aware, 'date_naive': naive})
+        self.db.collection.insert_one({'date_aware': aware, 'date_naive': naive})
         self.assert_document_count(1)
         # Given both date are equivalent, we can mix them
         self.db.collection.update_one(
@@ -2187,7 +2275,7 @@ class CollectionAPITest(TestCase):
                 returned = datetime(2000, 1, 1, 2, 0, 0, tzinfo=helpers.utc)
             else:
                 returned = datetime(2000, 1, 1, 2, 0, 0)
-            objid = db.collection.insert({'date_aware': aware, 'date_naive': naive})
+            objid = db.collection.insert_one({'date_aware': aware, 'date_naive': naive}).inserted_id
 
             objs = list(db.collection.find())
             self.assertEqual(objs, [{'_id': objid, 'date_aware': returned, 'date_naive': returned}])
@@ -2231,7 +2319,7 @@ class CollectionAPITest(TestCase):
         self.assertTrue(dates[0].tzinfo)
         self.assertEqual(dates[0].tzinfo, dates[1].tzinfo)
 
-    @skipIf(_HAVE_PYMONGO, 'pymongo installed')
+    @skipIf(helpers.HAVE_PYMONGO, 'pymongo installed')
     def test__current_date_timestamp_requires_pymongo(self):
         with self.assertRaises(NotImplementedError):
             self.db.collection.update_one(
@@ -2240,7 +2328,7 @@ class CollectionAPITest(TestCase):
                     'updated_again': {'$type': 'timestamp'},
                 }}, upsert=True)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__current_date_timestamp(self):
         before = datetime.now(tz_util.utc) - timedelta(seconds=1)
         self.db.collection.update_one(
@@ -2258,7 +2346,7 @@ class CollectionAPITest(TestCase):
         self.assertLessEqual(before, doc['updated_at'].as_datetime())
         self.assertLessEqual(doc['updated_at'].as_datetime(), after)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__insert_zero_timestamp(self):
         self.db.collection.drop()
         before = datetime.now(tz_util.utc) - timedelta(seconds=1)
@@ -2270,7 +2358,7 @@ class CollectionAPITest(TestCase):
         self.assertLessEqual(doc['zero'].as_datetime(), after)
 
     def test__rename_collection(self):
-        self.db.collection.insert({'_id': 1, 'test_list': [{'data': 'val'}]})
+        self.db.collection.insert_one({'_id': 1, 'test_list': [{'data': 'val'}]})
         coll = self.db.collection
 
         coll.rename('other_name')
@@ -2303,9 +2391,9 @@ class CollectionAPITest(TestCase):
 
     def test__cursor_rewind(self):
         coll = self.db.create_collection('a')
-        coll.insert({'a': 1})
-        coll.insert({'a': 2})
-        coll.insert({'a': 3})
+        coll.insert_one({'a': 1})
+        coll.insert_one({'a': 2})
+        coll.insert_one({'a': 3})
 
         curs = coll.find().sort('a')
         self.assertEqual(next(curs)['a'], 1)
@@ -2374,7 +2462,7 @@ class CollectionAPITest(TestCase):
         with self.assertRaises(TypeError):
             col.find().max_time_ms(3.4)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_insert_one(self):
         operations = [pymongo.InsertOne({'a': 1, 'b': 2})]
         result = self.db.collection.bulk_write(operations)
@@ -2388,7 +2476,7 @@ class CollectionAPITest(TestCase):
             'writeErrors': [], 'upserted': [], 'writeConcernErrors': [],
             'nRemoved': 0, 'nInserted': 1})
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_update_one(self):
         # Upsert == False
         self.db.collection.insert_one({'a': 1})
@@ -2416,7 +2504,7 @@ class CollectionAPITest(TestCase):
             'upserted': [{'_id': docs[0]['_id'], 'index': 0}],
             'nRemoved': 0, 'nInserted': 0})
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_update_many(self):
         # Upsert == False
         self.db.collection.insert_one({'a': 1, 'b': 1})
@@ -2445,7 +2533,7 @@ class CollectionAPITest(TestCase):
             'upserted': [{'_id': docs[0]['_id'], 'index': 0}],
             'nRemoved': 0, 'nInserted': 0})
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_replace_one(self):
         # Upsert == False
         self.db.collection.insert_one({'a': 1, 'b': 0})
@@ -2475,6 +2563,7 @@ class CollectionAPITest(TestCase):
             'upserted': [{'_id': docs[0]['_id'], 'index': 0}],
             'nRemoved': 0, 'nInserted': 0})
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above')
     def test__bulk_write_update_id(self):
         self.db.collection.insert_one({'_id': 1, 'a': 1})
         bulk = self.db.collection.initialize_unordered_bulk_op()
@@ -2487,7 +2576,7 @@ class CollectionAPITest(TestCase):
              'altered to _id: 42'],
             [e['errmsg'] for e in err_context.exception.details['writeErrors']])
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_delete_one(self):
         self.db.collection.insert_one({'a': 1})
         operations = [pymongo.DeleteOne({'a': 1})]
@@ -2501,7 +2590,7 @@ class CollectionAPITest(TestCase):
             'writeErrors': [], 'upserted': [], 'writeConcernErrors': [],
             'nRemoved': 1, 'nInserted': 0})
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_delete_many(self):
         self.db.collection.insert_one({'a': 1})
         self.db.collection.insert_one({'a': 1})
@@ -2516,7 +2605,7 @@ class CollectionAPITest(TestCase):
             'writeErrors': [], 'upserted': [], 'writeConcernErrors': [],
             'nRemoved': 2, 'nInserted': 0})
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_matched_count_no_changes(self):
         self.db.collection.insert_one({'name': 'luke'})
         result = self.db.collection.bulk_write([
@@ -2525,7 +2614,7 @@ class CollectionAPITest(TestCase):
         self.assertEqual(1, result.matched_count)
         self.assertEqual(0, result.modified_count)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__bulk_write_matched_count_replace_multiple_objects(self):
         self.db.collection.insert_one({'name': 'luke'})
         self.db.collection.insert_one({'name': 'anna'})
@@ -3951,6 +4040,28 @@ class CollectionAPITest(TestCase):
         ])
         self.assertEqual([{'a': 3}], list(actual))
 
+    def test__aggregate_project_first(self):
+        self.db.collection.insert_one({'_id': 1, 'arr': [2, 3]})
+        actual = self.db.collection.aggregate([
+            {'$match': {'_id': 1}},
+            {'$project': collections.OrderedDict([
+                ('_id', False),
+                ('a', {'$first': '$arr'})
+            ])}
+        ])
+        self.assertEqual([{'a': 2}], list(actual))
+
+    def test__aggregate_project_last(self):
+        self.db.collection.insert_one({'_id': 1, 'arr': [2, 3]})
+        actual = self.db.collection.aggregate([
+            {'$match': {'_id': 1}},
+            {'$project': collections.OrderedDict([
+                ('_id', False),
+                ('a', {'$last': '$arr'})
+            ])}
+        ])
+        self.assertEqual([{'a': 3}], list(actual))
+
     def test__aggregate_project_rename__id(self):
         self.db.collection.insert_one({'_id': 1, 'arr': [2, 3]})
         actual = self.db.collection.aggregate([
@@ -4417,7 +4528,7 @@ class CollectionAPITest(TestCase):
             'substr must have 3 items',
             str(err.exception))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_tostr_operation_objectid(self):
         self.db.collection.insert_one({
             'a': ObjectId('5abcfad1fbc93d00080cfe66')
@@ -4498,6 +4609,21 @@ class CollectionAPITest(TestCase):
         actual = self.db.collection.find({'arr': {'$type': 'object'}})
         expect = [{'_id': 2, 'arr': {'a': 4, 'b': 5}}]
 
+        self.assertEqual(expect, list(actual))
+
+    def test__find_type_number(self):
+        self.db.collection.insert_many([
+            {'_id': 1, 'a': 'str'},
+            {'_id': 2, 'a': 1},
+            {'_id': 3, 'a': {'b': 1}},
+            {'_id': 4, 'a': 1.2},
+            {'_id': 5, 'a': None},
+        ])
+        actual = self.db.collection.find({'a': {'$type': 'number'}})
+        expect = [
+            {'_id': 2, 'a': 1},
+            {'_id': 4, 'a': 1.2},
+        ]
         self.assertEqual(expect, list(actual))
 
     def test__find_unknown_type(self):
@@ -4714,7 +4840,7 @@ class CollectionAPITest(TestCase):
         self.db.collection.insert_one({'_id': 1, 'arr': {'a': 2, 'b': 3}})
         self.db.collection.insert_one({'_id': 2, 'arr': {'a': 4, 'b': 5}})
         new_collection = self.db.get_collection('new_collection')
-        new_collection.insert({'_id': 3})
+        new_collection.insert_one({'_id': 3})
         self.db.collection.aggregate([
             {'$match': {'_id': 1}},
             {
@@ -4730,7 +4856,7 @@ class CollectionAPITest(TestCase):
         self.assertEqual(expect, actual)
 
     def test__all_elemmatch(self):
-        self.db.collection.insert([
+        self.db.collection.insert_many([
             {
                 '_id': 5,
                 'code': 'xyz',
@@ -4814,6 +4940,13 @@ class CollectionAPITest(TestCase):
 
         results = self.db.collection.find({'shape.color': {'$eq': 'red'}})
         self.assertEqual([1, 3, 6], [doc['_id'] for doc in results])
+
+        # testing eq operation with null as value
+        results = self.db.collection.find({'shape.color': {'$eq': None}})
+        self.assertEqual([4, 5], [doc['_id'] for doc in results])
+
+        results = self.db.collection.find({'shape.color': None})
+        self.assertEqual([4, 5], [doc['_id'] for doc in results])
 
     def test__filter_ne_on_array(self):
         """$ne and $nin on array only matches if no element of the array matches."""
@@ -4902,7 +5035,7 @@ class CollectionAPITest(TestCase):
         query = {'counts': {'$gt': {'circles': re.compile('3')}}}
         self.assertFalse(list(collection.find(query)))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__filter_bson_regex(self):
         self.db.collection.insert_many([
             {'_id': 'a'},
@@ -4979,7 +5112,7 @@ class CollectionAPITest(TestCase):
             ])
         self.assertIn('batch op errors occurred', str(cm.exception))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test_insert_many_bulk_write_error_details(self):
         collection = self.db.collection
         with self.assertRaises(mongomock.BulkWriteError) as cm:
@@ -4991,34 +5124,30 @@ class CollectionAPITest(TestCase):
         write_errors = cm.exception.details['writeErrors']
         self.assertEqual([11000], [error.get('code') for error in write_errors])
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test_insert_bson_validation(self):
         collection = self.db.collection
         with self.assertRaises(InvalidDocument) as cm:
-            collection.insert({'a': {'b'}})
-        if version.LooseVersion(pymongo.version) < version.LooseVersion('3.8'):
+            collection.insert_one({'a': {'b'}})
+        if version.parse(pymongo.version) < version.parse('3.8'):
             return
-        if six.PY2:
-            expect = "cannot encode object: set(['b']), of type: <type 'set'>"
-        else:
-            expect = "cannot encode object: {'b'}, of type: <class 'set'>"
-        self.assertEqual(str(cm.exception), expect)
+        self.assertEqual(str(cm.exception), "cannot encode object: {'b'}, of type: <class 'set'>")
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test_insert_bson_invalid_encode_type(self):
         collection = self.db.collection
         with self.assertRaises(InvalidDocument) as cm:
-            collection.insert({'$foo': 'bar'})
+            collection.insert_one({'$foo': 'bar'})
         self.assertEqual(str(cm.exception), "key '$foo' must not start with '$'")
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__update_invalid_encode_type(self):
         self.db.collection.insert_one({'_id': 1, 'foo': 'bar'})
 
         with self.assertRaises(InvalidDocument):
             self.db.collection.update_one({}, {'$set': {'foo': {'bar'}}})
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__replace_invalid_encode_type(self):
         self.db.collection.insert_one({'_id': 1, 'foo': 'bar'})
 
@@ -5140,8 +5269,11 @@ class CollectionAPITest(TestCase):
         actual = collection.aggregate([
             {'$group': {'_id': '$a'}},
         ])
-        assertCountEqual(self, [{'_id': 1}, {'_id': 2}], list(actual))
+        self.assertCountEqual([{'_id': 1}, {'_id': 2}], list(actual))
 
+    @skipIf(
+        helpers.PYMONGO_VERSION >= version.parse('4.0'),
+        'pymongo v4 or above do not specify uuid encoding')
     def test__aggregate_group_uuid_key(self):
         collection = self.db.collection
         collection.insert_many(
@@ -5167,7 +5299,7 @@ class CollectionAPITest(TestCase):
         actual = collection.aggregate([
             {'$group': {'_id': '$a'}},
         ])
-        assertCountEqual(self, [{'_id': 1}, {'_id': None}], list(actual))
+        self.assertCountEqual([{'_id': 1}, {'_id': None}], list(actual))
 
     def test__aggregate_group_dict_key(self):
         collection = self.db.collection
@@ -5181,13 +5313,12 @@ class CollectionAPITest(TestCase):
         actual = collection.aggregate([
             {'$group': {'_id': {'a': '$a', 'b': '$b'}}},
         ])
-        assertCountEqual(
-            self,
+        self.assertCountEqual(
             [{'_id': {'a': 1, 'b': 1}}, {'_id': {'a': 2, 'b': 3}}],
             list(actual)
         )
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_group_dbref_key(self):
         collection = self.db.collection
         collection.insert_many(
@@ -5206,7 +5337,7 @@ class CollectionAPITest(TestCase):
             {'_id': DBRef('a', '2')},
             {'_id': DBRef('a', '1')},
         ]
-        assertCountEqual(self, expect, list(actual))
+        self.assertCountEqual(expect, list(actual))
 
     def test__aggregate_group_sum(self):
         collection = self.db.collection
@@ -5238,7 +5369,7 @@ class CollectionAPITest(TestCase):
         }]
         self.assertEqual(expect, list(actual))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_group_sum_for_decimal(self):
         collection = self.db.collection
         collection.drop()
@@ -5604,6 +5735,81 @@ class CollectionAPITest(TestCase):
                 self.db.collection.aggregate(
                     [{'$project': {'filtered_items': {'$filter': option}}}])
 
+    def test__aggregate_map(self):
+        collection = self.db.collection
+        collection.insert_one({
+            'array': [1, 2, 3, 4],
+        })
+        actual = collection.aggregate([{'$project': {
+            '_id': 0,
+            'array': {'$map': {
+                'input': '$array',
+                'in': {'$multiply': ['$$this', '$$this']},
+            }},
+            'custom_variable': {'$map': {
+                'input': '$array',
+                'as': 'self',
+                'in': {'$multiply': ['$$self', '$$self']},
+            }},
+            'empty': {'$map': {
+                'input': [],
+                'in': {'$multiply': ['$$this', '$$this']},
+            }},
+            'null': {'$map': {
+                'input': None,
+                'in': '$$this',
+            }},
+            'missing': {'$map': {
+                'input': '$missing.key',
+                'in': '$$this',
+            }},
+        }}])
+        expect = [{
+            'array': [1, 4, 9, 16],
+            'custom_variable': [1, 4, 9, 16],
+            'empty': [],
+            'null': None,
+            'missing': None,
+        }]
+        self.assertEqual(expect, list(actual))
+
+    def test__aggregate_map_errors(self):
+        collection = self.db.collection
+        collection.insert_one({})
+        data = (
+            (
+                [],
+                '$map only supports an object as its argument',
+            ),
+            (
+                {},
+                "Missing 'input' parameter to $map",
+            ),
+            (
+                # Check that the following message is raised before the error
+                # on the type of input
+                {'input': 'foo'},
+                "Missing 'in' parameter to $map",
+            ),
+            (
+                # NOTE: actual type is omitted in the expected message because
+                # of difference in string representations for types between
+                # Python 2 and Python 3.
+                # TODO(guludo): We should output the type name that is output
+                # by the real mongodb.
+                {'input': 'foo', 'in': '$$this'},
+                'input to $map must be an array not',
+            ),
+            (
+                {'input': [], 'in': '$$this', 'foo': 1},
+                'Unrecognized parameter to $map: foo',
+            ),
+        )
+        for op, msg in data:
+            with self.assertRaises(mongomock.OperationFailure) as cm:
+                collection.aggregate([{'$project': {'x': {'$map': op}}}])
+            self.assertIn(msg, str(cm.exception))
+
     def test__aggregate_slice(self):
         self.db.collection.drop()
         collection = self.db.collection
@@ -5749,11 +5955,12 @@ class CollectionAPITest(TestCase):
         collection = self.db.get_collection('a', read_preference=self.db.collection.read_preference)
         self.assertEqual('primary', collection.read_preference.mongos_mode)
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__read_preference(self):
         collection = self.db.get_collection('a', read_preference=ReadPreference.NEAREST)
         self.assertEqual('nearest', collection.read_preference.mongos_mode)
 
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above')
     def test__bulk_write_unordered(self):
         bulk = self.db.collection.initialize_unordered_bulk_op()
         bulk.insert({'_id': 1})
@@ -5765,10 +5972,26 @@ class CollectionAPITest(TestCase):
         with self.assertRaises(mongomock.BulkWriteError) as err_context:
             bulk.execute()
 
-        assertCountEqual(self, [1, 2, 3], [d['_id'] for d in self.db.collection.find()])
+        self.assertCountEqual([1, 2, 3], [d['_id'] for d in self.db.collection.find()])
         self.assertEqual(3, err_context.exception.details['nInserted'])
         self.assertEqual([2, 4], [e['index'] for e in err_context.exception.details['writeErrors']])
 
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
+    def test__bulk_write_unordered_with_bulk_write(self):
+        with self.assertRaises(mongomock.BulkWriteError) as err_context:
+            self.db.collection.bulk_write([
+                pymongo.InsertOne({'_id': 1}),
+                pymongo.InsertOne({'_id': 2}),
+                pymongo.InsertOne({'_id': 1}),
+                pymongo.InsertOne({'_id': 3}),
+                pymongo.InsertOne({'_id': 1}),
+            ], ordered=False)
+
+        self.assertCountEqual([1, 2, 3], [d['_id'] for d in self.db.collection.find()])
+        self.assertEqual(3, err_context.exception.details['nInserted'])
+        self.assertEqual([2, 4], [e['index'] for e in err_context.exception.details['writeErrors']])
+
+    @skipIf(helpers.PYMONGO_VERSION >= version.parse('4.0'), 'pymongo v4 or above')
     def test__bulk_write_ordered(self):
         bulk = self.db.collection.initialize_ordered_bulk_op()
         bulk.insert({'_id': 1})
@@ -5779,7 +6002,22 @@ class CollectionAPITest(TestCase):
         with self.assertRaises(mongomock.BulkWriteError) as err_context:
             bulk.execute()
 
-        assertCountEqual(self, [1, 2], [d['_id'] for d in self.db.collection.find()])
+        self.assertCountEqual([1, 2], [d['_id'] for d in self.db.collection.find()])
+        self.assertEqual(2, err_context.exception.details['nInserted'])
+        self.assertEqual([2], [e['index'] for e in err_context.exception.details['writeErrors']])
+
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
+    def test__bulk_write_ordered_with_bulk_write(self):
+        with self.assertRaises(mongomock.BulkWriteError) as err_context:
+            self.db.collection.bulk_write([
+                pymongo.InsertOne({'_id': 1}),
+                pymongo.InsertOne({'_id': 2}),
+                pymongo.InsertOne({'_id': 1}),
+                pymongo.InsertOne({'_id': 3}),
+                pymongo.InsertOne({'_id': 1}),
+            ])
+
+        self.assertCountEqual([1, 2], [d['_id'] for d in self.db.collection.find()])
         self.assertEqual(2, err_context.exception.details['nInserted'])
         self.assertEqual([2], [e['index'] for e in err_context.exception.details['writeErrors']])
 
@@ -5883,21 +6121,17 @@ class CollectionAPITest(TestCase):
         del stored_document['_id']
         self.assertEqual(
             dict(original_document, date=None), dict(stored_document, date=None))
-        if six.PY2:
-            with self.assertRaises(TypeError):
-                self.assertNotEqual(original_document, stored_document)
-        else:
-            self.assertNotEqual(
-                original_document, stored_document,
-                msg='The document is not the same because the date TZ has been stripped of and the '
-                'microseconds truncated.')
-            self.assertNotEqual(
-                original_document['date'].timestamp(), stored_document['date'].timestamp())
-            self.assertEqual(
-                datetime(2000, 1, 1, 10, 30, 30, 12000),
-                stored_document['date'],
-                msg='The stored document holds a date as timezone naive UTC and without '
-                'microseconds')
+        self.assertNotEqual(
+            original_document, stored_document,
+            msg='The document is not the same because the date TZ has been stripped of and the '
+            'microseconds truncated.')
+        self.assertNotEqual(
+            original_document['date'].timestamp(), stored_document['date'].timestamp())
+        self.assertEqual(
+            datetime(2000, 1, 1, 10, 30, 30, 12000),
+            stored_document['date'],
+            msg='The stored document holds a date as timezone naive UTC and without '
+            'microseconds')
 
         # The objects are not linked: modifying the inserted document or the fetched one will
         # have no effect on future retrievals.
@@ -5915,7 +6149,7 @@ class CollectionAPITest(TestCase):
             msg='Modifying the found document afterwards does not modify the stored document.')
         self.assertEqual(dict(original_document, date=None), dict(stored_document, date=None))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_to_string(self):
         collection = self.db.collection
         collection.insert_one({
@@ -5950,7 +6184,7 @@ class CollectionAPITest(TestCase):
         }]
         self.assertEqual(expect, list(actual))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_to_decimal(self):
         collection = self.db.collection
         collection.insert_one({
@@ -6035,7 +6269,7 @@ class CollectionAPITest(TestCase):
                 ]
             )
 
-    @skipIf(_HAVE_PYMONGO, 'pymongo installed')
+    @skipIf(helpers.HAVE_PYMONGO, 'pymongo installed')
     def test__aggregate_to_decimal_without_pymongo(self):
         collection = self.db.collection
         collection.insert_one({
@@ -6059,7 +6293,7 @@ class CollectionAPITest(TestCase):
                 ]
             )
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_to_int(self):
         collection = self.db.collection
         collection.insert_one({
@@ -6099,7 +6333,7 @@ class CollectionAPITest(TestCase):
         }]
         self.assertEqual(expect, list(actual))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_to_long(self):
         collection = self.db.collection
         collection.insert_one({
@@ -6138,7 +6372,7 @@ class CollectionAPITest(TestCase):
         }]
         self.assertEqual(expect, list(actual))
 
-    @skipIf(_HAVE_PYMONGO, 'pymongo installed')
+    @skipIf(helpers.HAVE_PYMONGO, 'pymongo installed')
     def test__aggregate_to_long_no_pymongo(self):
         collection = self.db.collection
         collection.drop()
@@ -6161,7 +6395,7 @@ class CollectionAPITest(TestCase):
                 ]
             ))
 
-    @skipIf(not _HAVE_PYMONGO, 'pymongo not installed')
+    @skipIf(not helpers.HAVE_PYMONGO, 'pymongo not installed')
     def test__aggregate_date_to_string(self):
         collection = self.db.collection
         collection.insert_one({
@@ -6329,6 +6563,102 @@ class CollectionAPITest(TestCase):
             with self.assertRaises(mongomock.OperationFailure):
                 collection.aggregate(item)
 
+    def test_aggregate_object_to_array(self):
+        collection = self.db.collection
+
+        collection.insert_many([
+            {'items': None},
+            {'items': {'qty': 25}},
+            {'items': {
+                'size': {'len': 25, 'w': 10, 'uom': 'cm'},
+            }},
+        ])
+
+        expect = [{
+            'items': None,
+            'not_exists': None
+        }, {
+            'items': [
+                {'k': 'qty', 'v': 25},
+            ],
+            'not_exists': None
+        }, {
+            'items': [
+                {'k': 'size', 'v': {'len': 25, 'w': 10, 'uom': 'cm'}},
+            ],
+            'not_exists': None
+        }]
+
+        actual = collection.aggregate([
+            {'$project': {
+                'items': {'$objectToArray': '$items'},
+                'not_exists': {'$objectToArray': '$nothing'},
+                '_id': 0
+            }}
+        ])
+        self.assertEqual(expect, list(actual))
+
+        # All of these items should trigger an error
+        items = [[
+            {'$addFields': {'items': ''}},
+            {'$project': {'items': {'$objectToArray': '$items'}, '_id': 0}}
+        ], [
+            {'$addFields': {'items': 100}},
+            {'$project': {'items': {'$objectToArray': '$items'}, '_id': 0}}
+        ], [
+            {'$addFields': {'items': [[]]}},
+            {'$project': {'items': {'$objectToArray': '$items'}, '_id': 0}}
+        ]]
+
+        for item in items:
+            with self.assertRaises(mongomock.OperationFailure):
+                collection.aggregate(item)
+
+    # https://docs.mongodb.com/manual/reference/operator/aggregation/objectToArray/#examples
+    @skipIf(
+        sys.version_info < (3, 6), "It's harder to keep dict sorted in older versions of Python")
+    def test_aggregate_object_to_array_with_example(self):
+        collection = self.db.collection
+
+        collection.insert_many([
+            {'_id': 1, 'item': 'ABC1', 'dimensions': collections.OrderedDict([
+                ('l', 25), ('w', 10), ('uom', 'cm'),
+            ])},
+            {'_id': 2, 'item': 'ABC2', 'dimensions': collections.OrderedDict([
+                ('l', 50), ('w', 25), ('uom', 'cm'),
+            ])},
+            {'_id': 3, 'item': 'XYZ1', 'dimensions': collections.OrderedDict([
+                ('l', 70), ('w', 75), ('uom', 'cm'),
+            ])},
+        ])
+
+        expect = [
+            {'_id': 1, 'item': 'ABC1', 'dims': [
+                {'k': 'l', 'v': 25},
+                {'k': 'w', 'v': 10},
+                {'k': 'uom', 'v': 'cm'},
+            ]},
+            {'_id': 2, 'item': 'ABC2', 'dims': [
+                {'k': 'l', 'v': 50},
+                {'k': 'w', 'v': 25},
+                {'k': 'uom', 'v': 'cm'},
+            ]},
+            {'_id': 3, 'item': 'XYZ1', 'dims': [
+                {'k': 'l', 'v': 70},
+                {'k': 'w', 'v': 75},
+                {'k': 'uom', 'v': 'cm'},
+            ]},
+        ]
+
+        actual = collection.aggregate([{
+            '$project': {
+                'item': 1,
+                'dims': {'$objectToArray': '$dimensions'},
+            },
+        }])
+
+        self.assertEqual(expect, list(actual))
+
     def test_aggregate_project_with_boolean(self):
         collection = self.db.collection
 
@@ -6488,6 +6818,12 @@ class CollectionAPITest(TestCase):
     def test_set_no_content(self):
         collection = self.db.collection
         collection.insert_one({'a': 1})
+
+        if version.parse(mongomock.SERVER_VERSION) >= version.parse('5.0'):
+            collection.update_one({}, {'$set': {}})
+            collection.update_one({'b': 'will-never-exist'}, {'$set': {}})
+            return
+
         with self.assertRaises(mongomock.WriteError):
             collection.update_one({}, {'$set': {}})
 
@@ -6551,7 +6887,7 @@ class CollectionAPITest(TestCase):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipUnless(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__not_hashable(self):
         with self.assertRaises(TypeError):
@@ -6559,7 +6895,7 @@ class CollectionAPITest(TestCase):
 
     @skipIf(sys.version_info < (3,), 'Older versions of Python do not handle hashing the same way')
     @skipIf(
-        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.LooseVersion('3.12'),
+        helpers.PYMONGO_VERSION and helpers.PYMONGO_VERSION < version.parse('3.12'),
         "older versions of pymongo didn't have proper hashing")
     def test__hashable(self):
         {self.db.a, self.db.b}  # pylint: disable=pointless-statement
@@ -6569,3 +6905,17 @@ class CollectionAPITest(TestCase):
             TypeError, msg='read_concern must be an instance of pymongo.read_concern.ReadConcern'
         ):
             mongomock.collection.Collection(self.db, 'foo', None, read_concern='bar')
+
+    def test__cursor_allow_disk_use(self):
+        col = self.db.col
+        col.find().allow_disk_use(True)
+        col.find().allow_disk_use(False)
+        col.find().allow_disk_use()
+        with self.assertRaises(TypeError):
+            col.find().allow_disk_use(1)
+        # use the keyword argument
+        col.find(allow_disk_use=True)
+        col.find(allow_disk_use=False)
+        col.find()
+        with self.assertRaises(TypeError):
+            col.find(allow_disk_use=1)

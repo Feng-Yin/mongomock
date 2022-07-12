@@ -1,12 +1,12 @@
 from .database import Database
 from .store import ServerStore
-from distutils import version  # pylint: disable=no-name-in-module
 import itertools
+import mongomock
 from mongomock import codec_options as mongomock_codec_options
 from mongomock import ConfigurationError
 from mongomock import helpers
 from mongomock import read_preferences
-from six import PY3
+from packaging import version
 import warnings
 
 try:
@@ -16,6 +16,11 @@ try:
 except ImportError:
     from .helpers import parse_uri, split_hosts
     _READ_PREFERENCE_PRIMARY = read_preferences.PRIMARY
+
+
+def _convert_version_to_list(version_str):
+    pieces = [int(part) for part in version_str.split('.')]
+    return pieces + [0] * (4 - len(pieces))
 
 
 class MongoClient(object):
@@ -54,6 +59,8 @@ class MongoClient(object):
 
         self.__default_database_name = dbase
 
+        self._server_version = mongomock.SERVER_VERSION
+
     def __getitem__(self, db_name):
         return self.get_database(db_name)
 
@@ -74,9 +81,7 @@ class MongoClient(object):
             return self.address == other.address
         return NotImplemented
 
-    if PY3 and (
-        not helpers.PYMONGO_VERSION or helpers.PYMONGO_VERSION >= version.LooseVersion('3.12')
-    ):
+    if helpers.PYMONGO_VERSION >= version.parse('3.12'):
         def __hash__(self):
             return hash(self.address)
 
@@ -105,18 +110,19 @@ class MongoClient(object):
 
     def server_info(self):
         return {
-            'version': '3.0.0',
+            'version': self._server_version,
             'sysInfo': 'Mock',
-            'versionArray': [3, 0, 0, 0],
+            'versionArray': _convert_version_to_list(self._server_version),
             'bits': 64,
             'debug': False,
             'maxBsonObjectSize': 16777216,
             'ok': 1
         }
 
-    def database_names(self):
-        warnings.warn('database_names is deprecated. Use list_database_names instead.')
-        return self.list_database_names()
+    if helpers.PYMONGO_VERSION < version.parse('4.0'):
+        def database_names(self):
+            warnings.warn('database_names is deprecated. Use list_database_names instead.')
+            return self.list_database_names()
 
     def list_database_names(self):
         return self._store.list_created_database_names()
@@ -124,7 +130,8 @@ class MongoClient(object):
     def drop_database(self, name_or_db):
 
         def drop_collections_for_db(_db):
-            for col_name in _db.list_collection_names():
+            db_store = self._store[_db.name]
+            for col_name in db_store.list_created_collection_names():
                 _db.drop_collection(col_name)
 
         if isinstance(name_or_db, Database):

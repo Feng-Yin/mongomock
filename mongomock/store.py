@@ -1,11 +1,9 @@
 import collections
 import datetime
-import mongomock  # Used for utcnow - please see https://github.com/mongomock/mongomock#utcnow
-import six
-import six.moves
-import threading
+import functools
 
-lock = threading.RLock()
+import mongomock
+from mongomock.thread import RWLock
 
 
 class ServerStore(object):
@@ -72,6 +70,9 @@ class CollectionStore(object):
         self.name = name
         self._ttl_indexes = {}
 
+        # 694 - Lock for safely iterating and mutating OrderedDicts
+        self._rwlock = RWLock()
+
     def create(self):
         self._is_force_created = True
 
@@ -105,31 +106,36 @@ class CollectionStore(object):
 
     def __contains__(self, key):
         self._remove_expired_documents()
-        return key in self._documents
+        with self._rwlock.reader():
+            return key in self._documents
 
     def __getitem__(self, key):
         self._remove_expired_documents()
-        return self._documents[key]
+        with self._rwlock.reader():
+            return self._documents[key]
 
     def __setitem__(self, key, val):
-        with lock:
+        with self._rwlock.writer():
             self._documents[key] = val
 
     def __delitem__(self, key):
-        del self._documents[key]
+        with self._rwlock.writer():
+            del self._documents[key]
 
     def __len__(self):
         self._remove_expired_documents()
-        return len(self._documents)
+        with self._rwlock.reader():
+            return len(self._documents)
 
     @property
     def documents(self):
         self._remove_expired_documents()
-        for doc in six.itervalues(self._documents):
-            yield doc
+        with self._rwlock.reader():
+            for doc in self._documents.values():
+                yield doc
 
     def _remove_expired_documents(self):
-        for index in six.itervalues(self._ttl_indexes):
+        for index in self._ttl_indexes.values():
             self._expire_documents(index)
 
     def _expire_documents(self, index):
@@ -147,12 +153,14 @@ class CollectionStore(object):
             return
 
         # "key" structure = list of (field name, direction) tuples
-        ttl_field_name = index['key'][0][0]
+        ttl_field_name = next(iter(index['key']))[0]
         ttl_now = mongomock.utcnow()
-        expired_ids = [
-            doc['_id'] for doc in six.itervalues(self._documents)
-            if self._value_meets_expiry(doc.get(ttl_field_name), expiry, ttl_now)
-        ]
+
+        with self._rwlock.reader():
+            expired_ids = [
+                doc['_id'] for doc in self._documents.values()
+                if self._value_meets_expiry(doc.get(ttl_field_name), expiry, ttl_now)
+            ]
 
         for exp_id in expired_ids:
             del self[exp_id]
@@ -169,7 +177,7 @@ def _get_min_datetime_from_value(val):
     if not val:
         return datetime.datetime.max
     if isinstance(val, list):
-        return six.moves.reduce(_min_dt, [datetime.datetime.max] + val)
+        return functools.reduce(_min_dt, [datetime.datetime.max] + val)
     return val
 
 
